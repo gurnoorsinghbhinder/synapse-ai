@@ -31,7 +31,20 @@ func main() {
 	defer stop()
 
 	bus := eventbus.NewMemoryBus()
-	repository := store.New()
+	var repository *store.Store
+	var err error
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL != "" {
+		repository, err = store.NewPostgresStore(dbURL)
+		if err != nil {
+			slog.Error("failed to connect to PostgreSQL database", "error", err)
+			os.Exit(1)
+		}
+		slog.Info("connected to PostgreSQL database successfully")
+	} else {
+		repository = store.New()
+		slog.Info("using in-memory data store fallback (set DATABASE_URL to use a persistent DB)")
+	}
 
 	var aiClient ai.Client
 	if os.Getenv("GEMINI_API_KEY") != "" || os.Getenv("GOOGLE_API_KEY") != "" {
