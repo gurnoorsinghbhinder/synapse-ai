@@ -9,6 +9,7 @@ type Client interface {
 	GenerateQuestion(QuestionRequest) (string, error)
 	EvaluateAnswer(EvaluationRequest) (EvaluationResult, error)
 	ExtractResumeContext(resumeText string) ([]string, error)
+	SummarizeInterview(SummarizeRequest) (string, error)
 }
 
 type QuestionRequest struct {
@@ -26,6 +27,25 @@ type EvaluationRequest struct {
 }
 
 type EvaluationResult struct {
+	TechnicalDepth int    `json:"technical_depth"`
+	Correctness    int    `json:"correctness"`
+	Communication  int    `json:"communication"`
+	Confidence     int    `json:"confidence"`
+	Feedback       string `json:"feedback"`
+}
+
+type SummarizeRequest struct {
+	Role       string
+	Transcript []TranscriptEntry
+	Scores     []ScoreEntry
+}
+
+type TranscriptEntry struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
+type ScoreEntry struct {
 	TechnicalDepth int    `json:"technical_depth"`
 	Correctness    int    `json:"correctness"`
 	Communication  int    `json:"communication"`
@@ -87,6 +107,22 @@ func (MockClient) ExtractResumeContext(resumeText string) ([]string, error) {
 		out = append(out, "No resume context uploaded yet; use general software engineering questions.")
 	}
 	return out, nil
+}
+
+func (MockClient) SummarizeInterview(req SummarizeRequest) (string, error) {
+	return fmt.Sprintf("Interview summary for %s role: %d questions answered. Average scores - Technical: %d/10, Communication: %d/10.",
+		req.Role, len(req.Transcript), avgScore(req.Scores, func(s ScoreEntry) int { return s.TechnicalDepth }), avgScore(req.Scores, func(s ScoreEntry) int { return s.Communication })), nil
+}
+
+func avgScore(scores []ScoreEntry, extract func(ScoreEntry) int) int {
+	if len(scores) == 0 {
+		return 0
+	}
+	sum := 0
+	for _, s := range scores {
+		sum += extract(s)
+	}
+	return sum / len(scores)
 }
 
 func fallback(value string, defaultValue string) string {
