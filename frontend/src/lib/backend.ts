@@ -63,6 +63,30 @@ export type Interview = {
   ended_at?: string;
 };
 
+export type QuestionPrediction = {
+  question: string;
+  buffer: string[];
+  topic: string;
+  difficulty: string;
+  strategy: string;
+  signals: string[];
+  topic_shift: boolean;
+};
+
+export function predictionFromEvent(event: BackendEvent): QuestionPrediction | null {
+  if (event.type !== "QuestionGenerated") return null;
+  const payload = event.payload ?? {};
+  return {
+    question: typeof payload.question === "string" ? payload.question : "",
+    buffer: Array.isArray(payload.buffer) ? (payload.buffer as string[]) : [],
+    topic: typeof payload.topic === "string" ? payload.topic : "",
+    difficulty: typeof payload.difficulty === "string" ? payload.difficulty : "",
+    strategy: typeof payload.strategy === "string" ? payload.strategy : "",
+    signals: Array.isArray(payload.signals) ? (payload.signals as string[]) : [],
+    topic_shift: Boolean(payload.topic_shift),
+  };
+}
+
 export type InterviewSnapshot = {
   interview: Interview;
   timeline: BackendEvent[];

@@ -11,14 +11,21 @@ function tickTs(prev: string) {
 
 function formatBackendEvent(event: BackendEvent): PipelineEvent {
   const payload = event.payload ?? {};
-  const detail =
-    typeof payload.question === "string"
-      ? payload.question
-      : typeof payload.answer === "string"
-        ? payload.answer
-        : typeof payload.feedback === "string"
-          ? payload.feedback
-          : event.topic;
+  let detail: string;
+  if (event.type === "QuestionGenerated") {
+    const topic = typeof payload.topic === "string" ? payload.topic : "";
+    const strategy = typeof payload.strategy === "string" ? payload.strategy : "";
+    const difficulty = typeof payload.difficulty === "string" ? payload.difficulty : "";
+    detail = `[${strategy}] ${topic} (${difficulty})`;
+  } else if (typeof payload.question === "string") {
+    detail = payload.question;
+  } else if (typeof payload.answer === "string") {
+    detail = payload.answer;
+  } else if (typeof payload.feedback === "string") {
+    detail = payload.feedback;
+  } else {
+    detail = event.topic;
+  }
 
   return {
     ts: new Date(event.timestamp).toTimeString().slice(0, 8),
@@ -27,9 +34,11 @@ function formatBackendEvent(event: BackendEvent): PipelineEvent {
     tone:
       event.type === "AnswerEvaluated" || event.type === "MetricsUpdated"
         ? "signal"
-        : event.type === "TimelineUpdated"
-          ? "muted"
-          : "brand",
+        : event.type === "QuestionGenerated"
+          ? "brand"
+          : event.type === "TimelineUpdated"
+            ? "muted"
+            : "brand",
   };
 }
 
