@@ -6,10 +6,12 @@ import {
   endInterview,
   getInterview,
   interviewEventsURL,
+  predictionFromEvent,
   scoreOverall,
   submitTranscript,
   type BackendEvent,
   type Interview,
+  type QuestionPrediction,
 } from "@/lib/backend";
 import { getInterviewId, saveSnapshot } from "@/lib/session";
 
@@ -36,6 +38,7 @@ function InterviewRoom() {
   );
   const [status, setStatus] = useState("Connecting to backend...");
   const [submitting, setSubmitting] = useState(false);
+  const [prediction, setPrediction] = useState<QuestionPrediction | null>(null);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -62,6 +65,10 @@ function InterviewRoom() {
         if (cancelled) return;
         setInterview(snapshot.interview);
         setEvents(snapshot.timeline ?? []);
+        const seeded = snapshot.timeline
+          ?.filter((e) => e.type === "QuestionGenerated")
+          .at(-1);
+        if (seeded) setPrediction(predictionFromEvent(seeded));
         saveSnapshot(snapshot);
         setStatus("Backend session active");
       })
@@ -71,6 +78,8 @@ function InterviewRoom() {
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as BackendEvent;
       setEvents((prev) => [...prev, event].slice(-80));
+      const next = predictionFromEvent(event);
+      if (next) setPrediction(next);
       if (
         event.type === "QuestionAsked" ||
         event.type === "AnswerEvaluated" ||
@@ -290,6 +299,47 @@ function InterviewRoom() {
                 ))}
               </ol>
             </div>
+
+            {prediction && (
+              <div className="rounded-xl border border-cockpit-border bg-cockpit-panel/50 p-6">
+                <p className="mb-3 font-mono text-[10px] uppercase tracking-widest text-cockpit-muted">
+                  Prediction Engine
+                </p>
+                <div className="space-y-2 font-mono text-[11px]">
+                  <div className="flex justify-between">
+                    <span className="text-cockpit-muted">Topic</span>
+                    <span className="text-brand">{prediction.topic}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-cockpit-muted">Strategy</span>
+                    <span>{prediction.strategy}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-cockpit-muted">Difficulty</span>
+                    <span>{prediction.difficulty}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-cockpit-muted">Topic Shift</span>
+                    <span>{prediction.topic_shift ? "Yes" : "No"}</span>
+                  </div>
+                  {prediction.signals.length > 0 && (
+                    <div className="pt-2 border-t border-cockpit-border">
+                      <span className="text-cockpit-muted">Signals</span>
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {prediction.signals.map((s) => (
+                          <span key={s} className="rounded bg-white/5 px-1.5 py-0.5 text-[10px] text-cockpit-muted">
+                            {s}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  <div className="pt-2 text-[10px] text-cockpit-muted/60 truncate" title={prediction.question}>
+                    Next: {prediction.question}
+                  </div>
+                </div>
+              </div>
+            )}
           </aside>
         </div>
       </main>

@@ -7,6 +7,7 @@ import (
 	"intervue/backend/internal/ai"
 	"intervue/backend/internal/eventbus"
 	"intervue/backend/internal/orchestrator"
+	"intervue/backend/internal/questionengine"
 	"intervue/backend/internal/store"
 	"intervue/backend/shared/events"
 	"intervue/backend/shared/models"
@@ -17,10 +18,17 @@ type Runtime struct {
 	store        *store.Store
 	ai           ai.Client
 	orchestrator *orchestrator.Orchestrator
+	questions    *questionengine.Engine
 }
 
 func NewRuntime(bus eventbus.Bus, store *store.Store, aiClient ai.Client, orch *orchestrator.Orchestrator) *Runtime {
-	return &Runtime{bus: bus, store: store, ai: aiClient, orchestrator: orch}
+	return &Runtime{
+		bus:          bus,
+		store:        store,
+		ai:           aiClient,
+		orchestrator: orch,
+		questions:    questionengine.New(),
+	}
 }
 
 func (r *Runtime) Start(ctx context.Context) {
@@ -70,25 +78,41 @@ func (r *Runtime) questionWorker(ctx context.Context) {
 		if !ok {
 			continue
 		}
+		resumeContext := r.resumeContext(interview.CandidateID)
 
-		question, _ := r.ai.GenerateQuestion(ai.QuestionRequest{
+		prediction := r.questions.Predict(questionengine.Input{
 			Role:             interview.Role,
 			PreviousQuestion: payload.Question,
 			Answer:           payload.Answer,
+			ResumeContext:    resumeContext,
+			History:          interview.Transcript,
+			Scores:           interview.Scores,
 			QuestionNumber:   interview.QuestionNumber,
 		})
-		buffer := []string{
-			question,
-			"What signal in this answer would convince you it is production-ready?",
-			"How would your design change if traffic increased by 10x?",
-		}
 
 		r.bus.Publish(ctx, events.New(events.QuestionTopic, event.InterviewID, events.QuestionGenerated, map[string]any{
-			"question": question,
-			"buffer":   buffer,
+			"question":    prediction.Question,
+			"buffer":      prediction.Buffer,
+			"topic":       prediction.Topic,
+			"difficulty":  prediction.Difficulty,
+			"strategy":    prediction.Strategy,
+			"signals":     prediction.Signals,
+			"topic_shift": prediction.TopicShift,
 		}))
-		_, _ = r.orchestrator.ApplyGeneratedQuestion(ctx, event.InterviewID, question, buffer)
+		_, _ = r.orchestrator.ApplyGeneratedQuestion(ctx, event.InterviewID, prediction.Question, prediction.Buffer)
 	}
+}
+
+func (r *Runtime) resumeContext(candidateID string) []string {
+	candidate, ok := r.store.Candidate(candidateID)
+	if !ok {
+		return nil
+	}
+	chunks, err := r.ai.ExtractResumeContext(candidate.ResumeText)
+	if err != nil {
+		return nil
+	}
+	return chunks
 }
 
 func (r *Runtime) evaluationWorker(ctx context.Context) {
