@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { interviewEventsURL, type BackendEvent } from "@/lib/backend";
 import { seedEvents, type PipelineEvent } from "@/lib/mock";
 
 function tickTs(prev: string) {
@@ -8,10 +9,54 @@ function tickTs(prev: string) {
   return next.toTimeString().slice(0, 8);
 }
 
-export function EventStream({ compact = false }: { compact?: boolean }) {
+function formatBackendEvent(event: BackendEvent): PipelineEvent {
+  const payload = event.payload ?? {};
+  const detail =
+    typeof payload.question === "string"
+      ? payload.question
+      : typeof payload.answer === "string"
+        ? payload.answer
+        : typeof payload.feedback === "string"
+          ? payload.feedback
+          : event.topic;
+
+  return {
+    ts: new Date(event.timestamp).toTimeString().slice(0, 8),
+    type: event.type,
+    detail,
+    tone:
+      event.type === "AnswerEvaluated" || event.type === "MetricsUpdated"
+        ? "signal"
+        : event.type === "TimelineUpdated"
+          ? "muted"
+          : "brand",
+  };
+}
+
+export function EventStream({
+  compact = false,
+  interviewId,
+  initialEvents = [],
+}: {
+  compact?: boolean;
+  interviewId?: string | null;
+  initialEvents?: BackendEvent[];
+}) {
   const [events, setEvents] = useState<PipelineEvent[]>(seedEvents);
 
   useEffect(() => {
+    if (interviewId) {
+      setEvents((initialEvents.length ? initialEvents : []).map(formatBackendEvent).slice(-(compact ? 6 : 14)));
+      const socket = new WebSocket(interviewEventsURL(interviewId));
+      socket.onmessage = (message) => {
+        const event = JSON.parse(message.data) as BackendEvent;
+        setEvents((prev) => [...prev, formatBackendEvent(event)].slice(-(compact ? 6 : 14)));
+      };
+      socket.onerror = () => socket.close();
+      return () => socket.close();
+    }
+
+    setEvents(seedEvents);
     const id = setInterval(() => {
       setEvents((prev) => {
         const last = prev[prev.length - 1];
@@ -25,7 +70,7 @@ export function EventStream({ compact = false }: { compact?: boolean }) {
       });
     }, 1400);
     return () => clearInterval(id);
-  }, [compact]);
+  }, [compact, interviewId, initialEvents]);
 
   return (
     <div className="space-y-1.5">

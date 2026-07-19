@@ -1,7 +1,10 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { SiteNav } from "@/components/site-nav";
 import { mockInterviews, mockUser } from "@/lib/mock";
+import { startInterview, uploadResume } from "@/lib/backend";
+import { getCandidateId, setCandidateId, setInterviewId } from "@/lib/session";
 import { FileCheck2, PlayCircle, Settings, Cpu, ArrowUpRight } from "lucide-react";
+import { useState } from "react";
 
 export const Route = createFileRoute("/dashboard")({
   head: () => ({
@@ -16,6 +19,38 @@ export const Route = createFileRoute("/dashboard")({
 });
 
 function Dashboard() {
+  const nav = useNavigate();
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function startSession() {
+    setStarting(true);
+    setError(null);
+    try {
+      let candidateId = getCandidateId();
+      if (!candidateId) {
+        const profile = await uploadResume({
+          name: mockUser.name,
+          email: "demo@synapse.local",
+          resumeText:
+            "Built event-driven interview systems with Go, Kafka-compatible topics, worker fanout, WebSockets, Postgres, Redis, and React.",
+        });
+        candidateId = profile.candidate.id;
+        setCandidateId(candidateId);
+      }
+      const interview = await startInterview({
+        candidateId,
+        role: mockUser.role,
+      });
+      setInterviewId(interview.id);
+      nav({ to: "/interview" });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start interview");
+    } finally {
+      setStarting(false);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-background">
       <SiteNav />
@@ -32,13 +67,19 @@ function Dashboard() {
               Everything is warm — resume parsed, workers idle, latency nominal.
             </p>
           </div>
-          <Link
-            to="/interview"
+          <button
+            onClick={() => void startSession()}
+            disabled={starting}
             className="inline-flex h-11 items-center gap-2 self-start rounded-md bg-foreground px-6 text-sm font-medium text-background hover:opacity-90"
           >
-            Start new interview <ArrowUpRight className="size-4" />
-          </Link>
+            {starting ? "Starting..." : "Start new interview"} <ArrowUpRight className="size-4" />
+          </button>
         </header>
+        {error && (
+          <div className="mb-6 rounded-md border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+            {error}
+          </div>
+        )}
 
         <section className="mb-12 grid gap-4 md:grid-cols-3">
           <StatCard label="Resume" value="Uploaded" caption="8 skills · 2 projects parsed" tone="brand" />
@@ -47,7 +88,7 @@ function Dashboard() {
         </section>
 
         <section className="mb-12 grid gap-4 md:grid-cols-4">
-          <ActionTile to="/interview" icon={<PlayCircle className="size-5" />} title="Start Interview" desc="Live session" primary />
+          <ActionTile onClick={startSession} icon={<PlayCircle className="size-5" />} title={starting ? "Starting..." : "Start Interview"} desc="Live session" primary />
           <ActionTile to="/resume" icon={<FileCheck2 className="size-5" />} title="Resume" desc="Review profile" />
           <ActionTile to="/dashboard" icon={<Settings className="size-5" />} title="Settings" desc="Preferences" />
           <ActionTile to="/engineering" icon={<Cpu className="size-5" />} title="Architecture" desc="Judge mode" />
@@ -107,18 +148,16 @@ function StatCard({
 }
 
 function ActionTile({
-  to, icon, title, desc, primary,
-}: { to: string; icon: React.ReactNode; title: string; desc: string; primary?: boolean }) {
-  return (
-    <Link
-      to={to}
-      className={
-        "group flex flex-col justify-between gap-8 rounded-xl border p-6 transition-all hover:-translate-y-0.5 " +
-        (primary
-          ? "border-transparent bg-cockpit text-cockpit-foreground hover:opacity-95"
-          : "border-border bg-card hover:border-foreground/20")
-      }
-    >
+  to, onClick, icon, title, desc, primary,
+}: { to?: string; onClick?: () => void | Promise<void>; icon: React.ReactNode; title: string; desc: string; primary?: boolean }) {
+  const className =
+    "group flex flex-col justify-between gap-8 rounded-xl border p-6 text-left transition-all hover:-translate-y-0.5 " +
+    (primary
+      ? "border-transparent bg-cockpit text-cockpit-foreground hover:opacity-95"
+      : "border-border bg-card hover:border-foreground/20");
+
+  const content = (
+    <>
       <div className={"flex size-10 items-center justify-center rounded-md " + (primary ? "bg-brand text-brand-foreground" : "bg-muted")}>
         {icon}
       </div>
@@ -126,6 +165,23 @@ function ActionTile({
         <p className="font-display text-lg font-semibold tracking-tight">{title}</p>
         <p className={"text-xs " + (primary ? "text-cockpit-muted" : "text-muted-foreground")}>{desc}</p>
       </div>
+    </>
+  );
+
+  if (onClick) {
+    return (
+      <button onClick={() => void onClick()} className={className}>
+        {content}
+      </button>
+    );
+  }
+
+  return (
+    <Link
+      to={to ?? "/dashboard"}
+      className={className}
+    >
+      {content}
     </Link>
   );
 }

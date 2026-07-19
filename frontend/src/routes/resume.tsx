@@ -1,6 +1,8 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { SiteNav } from "@/components/site-nav";
 import { mockExperience, mockProjects, mockSkills } from "@/lib/mock";
+import { uploadResume } from "@/lib/backend";
+import { setCandidateId } from "@/lib/session";
 import { UploadCloud, FileText, Check } from "lucide-react";
 import { useState } from "react";
 
@@ -18,8 +20,38 @@ export const Route = createFileRoute("/resume")({
 
 function ResumePage() {
   const nav = useNavigate();
-  const [parsed, setParsed] = useState(true);
+  const [parsed, setParsed] = useState(false);
   const [drag, setDrag] = useState(false);
+  const [name, setName] = useState("Demo Candidate");
+  const [email, setEmail] = useState("demo@synapse.local");
+  const [resumeText, setResumeText] = useState(
+    "Built realtime systems with Go, Kafka-compatible events, WebSockets, Redis, Postgres, and React. Led backend architecture for low-latency interview workflows.",
+  );
+  const [fileName, setFileName] = useState("resume.txt");
+  const [status, setStatus] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  async function readFile(file: File) {
+    const text = await file.text();
+    setFileName(file.name);
+    setResumeText(text);
+    setParsed(false);
+  }
+
+  async function saveProfile() {
+    setSaving(true);
+    setStatus(null);
+    try {
+      const result = await uploadResume({ name, email, resumeText });
+      setCandidateId(result.candidate.id);
+      setParsed(true);
+      setStatus(`Backend profile ready · ${result.candidate.id}`);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Resume upload failed");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -40,7 +72,12 @@ function ResumePage() {
           <div
             onDragOver={(e) => { e.preventDefault(); setDrag(true); }}
             onDragLeave={() => setDrag(false)}
-            onDrop={(e) => { e.preventDefault(); setDrag(false); setParsed(true); }}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDrag(false);
+              const file = e.dataTransfer.files[0];
+              if (file) void readFile(file);
+            }}
             className={
               "flex flex-col items-center justify-center gap-4 rounded-xl border-2 border-dashed p-12 text-center transition-colors " +
               (drag ? "border-brand bg-brand/5" : "border-border bg-card")
@@ -53,12 +90,45 @@ function ResumePage() {
               <p className="font-medium">Drop your resume PDF here</p>
               <p className="text-xs text-muted-foreground">Max 5 MB · PDF or DOCX</p>
             </div>
-            <button
-              onClick={() => setParsed(true)}
-              className="mt-2 inline-flex h-9 items-center rounded-md bg-foreground px-4 text-xs font-medium text-background hover:opacity-90"
-            >
+            <label className="mt-2 inline-flex h-9 cursor-pointer items-center rounded-md bg-foreground px-4 text-xs font-medium text-background hover:opacity-90">
               Choose file
-            </button>
+              <input
+                type="file"
+                className="sr-only"
+                accept=".txt,.md,.pdf,.doc,.docx"
+                onChange={(e) => {
+                  const file = e.currentTarget.files?.[0];
+                  if (file) void readFile(file);
+                }}
+              />
+            </label>
+          </div>
+          <div className="mt-4 grid gap-3 rounded-xl border border-border bg-card p-5 md:grid-cols-2">
+            <label className="space-y-2 text-xs font-medium">
+              Candidate name
+              <input
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-brand"
+              />
+            </label>
+            <label className="space-y-2 text-xs font-medium">
+              Email
+              <input
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-brand"
+              />
+            </label>
+            <label className="space-y-2 text-xs font-medium md:col-span-2">
+              Resume text sent to backend
+              <textarea
+                value={resumeText}
+                onChange={(e) => setResumeText(e.target.value)}
+                rows={6}
+                className="w-full resize-none rounded-md border border-border bg-background px-3 py-2 text-sm leading-relaxed outline-none focus:border-brand"
+              />
+            </label>
           </div>
           {parsed && (
             <div className="mt-4 flex items-center gap-3 rounded-md border border-brand/30 bg-brand/5 px-4 py-3 text-sm">
@@ -66,12 +136,13 @@ function ResumePage() {
                 <Check className="size-3.5" />
               </div>
               <div className="flex-1">
-                <p className="font-medium">bhinder_resume_v4.pdf</p>
-                <p className="text-xs text-muted-foreground">Parsed · 8 skills · 2 projects · 2 roles · embeddings synced</p>
+                <p className="font-medium">{fileName}</p>
+                <p className="text-xs text-muted-foreground">{status ?? "Parsed · backend candidate profile synced"}</p>
               </div>
               <FileText className="size-4 text-muted-foreground" />
             </div>
           )}
+          {status && !parsed && <p className="mt-3 text-sm text-destructive">{status}</p>}
         </section>
 
         <section className="mb-10">
@@ -124,10 +195,11 @@ function ResumePage() {
             Cancel
           </button>
           <button
-            onClick={() => nav({ to: "/dashboard" })}
+            onClick={() => void saveProfile()}
+            disabled={saving}
             className="h-11 rounded-md bg-foreground px-6 text-sm font-medium text-background hover:opacity-90"
           >
-            Save profile
+            {saving ? "Saving..." : "Save profile"}
           </button>
         </div>
       </main>

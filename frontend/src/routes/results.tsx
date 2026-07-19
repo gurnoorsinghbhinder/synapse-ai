@@ -1,6 +1,9 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { SiteNav } from "@/components/site-nav";
 import { mockGrowth, mockScores, mockStrengths } from "@/lib/mock";
+import { getInterview, scoreOverall, type InterviewSnapshot } from "@/lib/backend";
+import { getInterviewId, loadSnapshot, saveSnapshot } from "@/lib/session";
+import { useEffect, useState } from "react";
 
 export const Route = createFileRoute("/results")({
   head: () => ({
@@ -15,6 +18,28 @@ export const Route = createFileRoute("/results")({
 });
 
 function Results() {
+  const [snapshot, setSnapshot] = useState<InterviewSnapshot | null>(() => loadSnapshot());
+
+  useEffect(() => {
+    const id = getInterviewId();
+    if (!id) return;
+    getInterview(id)
+      .then((fresh) => {
+        setSnapshot(fresh);
+        saveSnapshot(fresh);
+      })
+      .catch(() => {});
+  }, []);
+
+  const interview = snapshot?.interview;
+  const latestScore = interview?.scores?.at(-1);
+  const overall = latestScore ? scoreOverall(latestScore) : mockScores.overall;
+  const technical = latestScore ? latestScore.technical_depth * 10 : mockScores.technical;
+  const communication = latestScore ? latestScore.communication * 10 : mockScores.communication;
+  const problemSolving = latestScore ? latestScore.correctness * 10 : mockScores.problemSolving;
+  const confidence = latestScore ? latestScore.confidence * 10 : mockScores.confidence;
+  const feedback = latestScore?.feedback;
+
   return (
     <div className="min-h-screen bg-background">
       <SiteNav />
@@ -26,7 +51,7 @@ function Results() {
             </p>
             <h1 className="font-display text-4xl font-semibold tracking-tight">Evaluation summary</h1>
             <p className="text-sm text-muted-foreground">
-              Candidate: Bhinder · Senior Backend Engineer role · 34 min
+              Candidate: {interview?.candidate_id ?? "Bhinder"} · {interview?.role ?? "Senior Backend Engineer"} role · {interview?.transcript?.length ?? 0} answers
             </p>
           </div>
           <div className="flex gap-2">
@@ -44,16 +69,16 @@ function Results() {
             <p className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
               Overall score
             </p>
-            <h3 className="mt-6 font-display text-7xl font-semibold leading-none">{mockScores.overall}</h3>
+            <h3 className="mt-6 font-display text-7xl font-semibold leading-none">{overall}</h3>
             <p className="mt-3 text-xs text-brand">Strong hire</p>
           </div>
           <div className="space-y-6 rounded-xl border border-border bg-card p-6">
-            <ScoreRow label="Technical" value={mockScores.technical} />
-            <ScoreRow label="Communication" value={mockScores.communication} />
+            <ScoreRow label="Technical" value={technical} />
+            <ScoreRow label="Communication" value={communication} />
           </div>
           <div className="space-y-6 rounded-xl border border-border bg-card p-6">
-            <ScoreRow label="Problem solving" value={mockScores.problemSolving} />
-            <ScoreRow label="Confidence" value={mockScores.confidence} />
+            <ScoreRow label="Problem solving" value={problemSolving} />
+            <ScoreRow label="Confidence" value={confidence} />
           </div>
           <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-brand/30 bg-brand/5 p-6 text-center">
             <p className="font-mono text-[10px] uppercase tracking-widest text-brand">Recommendation</p>
@@ -65,7 +90,12 @@ function Results() {
         </section>
 
         <section className="grid gap-4 md:grid-cols-2">
-          <ListCard label="/strengths" title="Primary strengths" items={mockStrengths} dot="bg-brand" />
+          <ListCard
+            label="/strengths"
+            title="Primary strengths"
+            items={feedback ? [feedback, ...mockStrengths.slice(0, 2)] : mockStrengths}
+            dot="bg-brand"
+          />
           <ListCard label="/growth" title="Growth areas" items={mockGrowth} dot="bg-signal" />
         </section>
       </main>

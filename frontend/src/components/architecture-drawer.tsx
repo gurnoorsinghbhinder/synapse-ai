@@ -1,13 +1,18 @@
-import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import type { BackendEvent } from "@/lib/backend";
 import { EventStream } from "./event-stream";
 import { PipelineDiagram } from "./pipeline-diagram";
 
 export function ArchitectureDrawer({
   open,
   onOpenChange,
+  interviewId,
+  events,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
+  interviewId?: string | null;
+  events?: BackendEvent[];
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -23,6 +28,9 @@ export function ArchitectureDrawer({
               live
             </span>
           </SheetTitle>
+          <SheetDescription className="sr-only">
+            Live backend event stream, active pipeline, and worker metrics for the current interview.
+          </SheetDescription>
         </SheetHeader>
 
         <div className="space-y-10 overflow-y-auto p-6">
@@ -30,7 +38,7 @@ export function ArchitectureDrawer({
             <p className="font-mono text-[10px] uppercase tracking-widest text-cockpit-muted">
               Event Stream
             </p>
-            <EventStream />
+            <EventStream interviewId={interviewId} initialEvents={events} />
           </section>
 
           <section className="space-y-4">
