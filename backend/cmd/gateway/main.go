@@ -16,8 +16,11 @@ import (
 	"intervue/backend/internal/eventbus"
 	"intervue/backend/internal/gateway"
 	"intervue/backend/internal/orchestrator"
+	"intervue/backend/internal/storage"
 	"intervue/backend/internal/store"
+	"intervue/backend/internal/stt"
 	"intervue/backend/internal/transport"
+	"intervue/backend/internal/tts"
 	"intervue/backend/internal/workers"
 )
 
@@ -40,11 +43,34 @@ func main() {
 	}
 
 	orch := orchestrator.New(bus, repository, aiClient)
-	workerRuntime := workers.NewRuntime(bus, repository, aiClient, orch)
+
+	var ttsClient tts.Client
+	ttsClient = tts.NewMockClient()
+	slog.Info("using mock TTS client for audio synthesis")
+
+	var storageClient storage.Client
+	supabaseURL := os.Getenv("SUPABASE_URL")
+	supabaseKey := os.Getenv("SUPABASE_KEY")
+	supabaseBucket := getenv("SUPABASE_BUCKET", "interview-audio")
+
+	if supabaseURL != "" && supabaseKey != "" {
+		storageClient = storage.NewSupabaseClient(supabaseURL, supabaseKey, supabaseBucket)
+		slog.Info("using Supabase storage client", "bucket", supabaseBucket)
+	} else {
+		storageClient = storage.NewMockStorageClient()
+		slog.Info("using mock storage client (set SUPABASE_URL and SUPABASE_KEY for Supabase)")
+	}
+
+	workerRuntime := workers.NewRuntimeWithTTS(bus, repository, aiClient, orch, ttsClient, storageClient)
 	workerRuntime.Start(ctx)
 
 	ws := transport.NewWebSocketHub(bus, bus)
-	server := gateway.New(repository, orch, ws)
+
+	var sttClient stt.Client
+	sttClient = stt.NewMockClient()
+	slog.Info("using mock STT client for audio transcription")
+
+	server := gateway.NewWithAudio(repository, orch, ws, bus, sttClient)
 
 	port := getenv("PORT", "8080")
 	httpServer := &http.Server{

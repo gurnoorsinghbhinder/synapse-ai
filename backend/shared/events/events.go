@@ -19,6 +19,10 @@ const (
 	QuestionGenerated   Type = "QuestionGenerated"
 	MetricsUpdated      Type = "MetricsUpdated"
 	TimelineUpdated     Type = "TimelineUpdated"
+
+	// TTS events
+	AudioQueued Type = "AudioQueued"
+	AudioReady  Type = "AudioReady"
 )
 
 type Topic string
@@ -29,6 +33,7 @@ const (
 	QuestionTopic   Topic = "question.events"
 	EvaluationTopic Topic = "evaluation.events"
 	AnalyticsTopic  Topic = "analytics.events"
+	AudioTopic      Topic = "audio.events"
 )
 
 type Event struct {

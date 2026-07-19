@@ -14,7 +14,9 @@ export type EventType =
   | "AnswerEvaluated"
   | "QuestionGenerated"
   | "MetricsUpdated"
-  | "TimelineUpdated";
+  | "TimelineUpdated"
+  | "AudioQueued"
+  | "AudioReady";
 
 export type BackendEvent = {
   id: string;

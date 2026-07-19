@@ -17,6 +17,12 @@ function formatBackendEvent(event: BackendEvent): PipelineEvent {
     const strategy = typeof payload.strategy === "string" ? payload.strategy : "";
     const difficulty = typeof payload.difficulty === "string" ? payload.difficulty : "";
     detail = `[${strategy}] ${topic} (${difficulty})`;
+  } else if (event.type === "AudioQueued") {
+    const status = typeof payload.status === "string" ? payload.status : "";
+    detail = `TTS ${status}...`;
+  } else if (event.type === "AudioReady") {
+    const size = typeof payload.size_bytes === "number" ? `${(payload.size_bytes / 1024).toFixed(1)}KB` : "";
+    detail = `TTS audio ready ${size}`;
   } else if (typeof payload.question === "string") {
     detail = payload.question;
   } else if (typeof payload.answer === "string") {
@@ -34,11 +40,13 @@ function formatBackendEvent(event: BackendEvent): PipelineEvent {
     tone:
       event.type === "AnswerEvaluated" || event.type === "MetricsUpdated"
         ? "signal"
-        : event.type === "QuestionGenerated"
+        : event.type === "QuestionGenerated" || event.type === "AudioReady"
           ? "brand"
-          : event.type === "TimelineUpdated"
+          : event.type === "AudioQueued"
             ? "muted"
-            : "brand",
+            : event.type === "TimelineUpdated"
+              ? "muted"
+              : "brand",
   };
 }
 

@@ -7,7 +7,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"strings"
@@ -57,6 +56,7 @@ func (h *WebSocketHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		events.QuestionTopic,
 		events.EvaluationTopic,
 		events.AnalyticsTopic,
+		events.AudioTopic,
 	)
 
 	for event := range ch {
@@ -117,15 +117,23 @@ func writeJSONFrame(rw *bufio.ReadWriter, value any) error {
 }
 
 func writeTextFrame(rw *bufio.ReadWriter, payload []byte) error {
-	if len(payload) > 65535 {
-		return fmt.Errorf("websocket frame too large: %d bytes", len(payload))
-	}
-
 	header := []byte{0x81}
-	if len(payload) < 126 {
-		header = append(header, byte(len(payload)))
+	length := len(payload)
+	if length < 126 {
+		header = append(header, byte(length))
+	} else if length <= 65535 {
+		header = append(header, 126, byte(length>>8), byte(length))
 	} else {
-		header = append(header, 126, byte(len(payload)>>8), byte(len(payload)))
+		header = append(header, 127,
+			byte(length>>56),
+			byte(length>>48),
+			byte(length>>40),
+			byte(length>>32),
+			byte(length>>24),
+			byte(length>>16),
+			byte(length>>8),
+			byte(length),
+		)
 	}
 	if _, err := rw.Write(header); err != nil {
 		return err

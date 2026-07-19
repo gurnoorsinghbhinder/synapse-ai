@@ -4,11 +4,14 @@ import (
 	"context"
 	"time"
 
+	"encoding/json"
 	"intervue/backend/internal/ai"
 	"intervue/backend/internal/eventbus"
 	"intervue/backend/internal/orchestrator"
 	"intervue/backend/internal/questionengine"
+	"intervue/backend/internal/storage"
 	"intervue/backend/internal/store"
+	"intervue/backend/internal/tts"
 	"intervue/backend/shared/events"
 	"intervue/backend/shared/models"
 )
@@ -19,6 +22,8 @@ type Runtime struct {
 	ai           ai.Client
 	orchestrator *orchestrator.Orchestrator
 	questions    *questionengine.Engine
+	tts          tts.Client
+	storage      storage.Client
 }
 
 func NewRuntime(bus eventbus.Bus, store *store.Store, aiClient ai.Client, orch *orchestrator.Orchestrator) *Runtime {
@@ -31,12 +36,33 @@ func NewRuntime(bus eventbus.Bus, store *store.Store, aiClient ai.Client, orch *
 	}
 }
 
+func NewRuntimeWithTTS(bus eventbus.Bus, store *store.Store, aiClient ai.Client, orch *orchestrator.Orchestrator, ttsClient tts.Client, storageClient storage.Client) *Runtime {
+	return &Runtime{
+		bus:          bus,
+		store:        store,
+		ai:           aiClient,
+		orchestrator: orch,
+		questions:    questionengine.New(),
+		tts:          ttsClient,
+		storage:      storageClient,
+	}
+}
+
 func (r *Runtime) Start(ctx context.Context) {
 	go r.resumeContextWorker(ctx)
 	go r.questionWorker(ctx)
 	go r.evaluationWorker(ctx)
 	go r.analyticsWorker(ctx)
 	go r.timelineWorker(ctx)
+
+	if r.storage != nil {
+		go r.cleanupWorker(ctx)
+	}
+
+	// Start TTS worker if a TTS client and storage are configured
+	if r.tts != nil && r.storage != nil {
+		startTTSWorker(ctx, r.bus, r.tts, r.storage)
+	}
 }
 
 func (r *Runtime) resumeContextWorker(ctx context.Context) {
@@ -170,8 +196,19 @@ func (r *Runtime) analyticsWorker(ctx context.Context) {
 }
 
 func (r *Runtime) timelineWorker(ctx context.Context) {
-	ch := r.bus.Subscribe(ctx, "timeline-worker", events.InterviewTopic, events.TranscriptTopic, events.QuestionTopic, events.EvaluationTopic, events.AnalyticsTopic)
+	ch := r.bus.Subscribe(ctx, "timeline-worker", events.InterviewTopic, events.TranscriptTopic, events.QuestionTopic, events.EvaluationTopic, events.AnalyticsTopic, events.AudioTopic)
 	for event := range ch {
+		if event.Type == events.AudioReady {
+			var audioPayload map[string]any
+			if err := json.Unmarshal(event.Payload, &audioPayload); err == nil {
+				if _, exists := audioPayload["audio"]; exists {
+					audioPayload["audio"] = "[omitted for size]"
+					if cleaned, err := json.Marshal(audioPayload); err == nil {
+						event.Payload = cleaned
+					}
+				}
+			}
+		}
 		r.store.AppendTimeline(event)
 		if event.Type == events.TimelineUpdated {
 			continue
@@ -180,5 +217,18 @@ func (r *Runtime) timelineWorker(ctx context.Context) {
 			"event_id": event.ID,
 			"type":     event.Type,
 		}))
+	}
+}
+
+func (r *Runtime) cleanupWorker(ctx context.Context) {
+	ch := r.bus.Subscribe(ctx, "storage-cleanup-worker", events.InterviewTopic)
+	for event := range ch {
+		if event.Type != events.InterviewFinished {
+			continue
+		}
+
+		go func(interviewID string) {
+			_ = r.storage.DeleteFolder(context.Background(), interviewID)
+		}(event.InterviewID)
 	}
 }

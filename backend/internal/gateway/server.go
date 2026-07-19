@@ -8,8 +8,10 @@ import (
 	"strings"
 	"time"
 
+	"intervue/backend/internal/eventbus"
 	"intervue/backend/internal/orchestrator"
 	"intervue/backend/internal/store"
+	"intervue/backend/internal/stt"
 	"intervue/backend/internal/transport"
 	"intervue/backend/shared/events"
 	"intervue/backend/shared/models"
@@ -20,14 +22,29 @@ type Server struct {
 	store        *store.Store
 	orchestrator *orchestrator.Orchestrator
 	ws           *transport.WebSocketHub
+	audioWS      *transport.AudioWebSocketHub
 }
 
-func New(store *store.Store, orchestrator *orchestrator.Orchestrator, ws *transport.WebSocketHub) *Server {
+func New(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebSocketHub) *Server {
 	server := &Server{
 		mux:          http.NewServeMux(),
 		store:        store,
-		orchestrator: orchestrator,
+		orchestrator: orch,
 		ws:           ws,
+	}
+	server.routes()
+	return server
+}
+
+// NewWithAudio creates a server with audio WebSocket support.
+// Pass in the eventbus.Bus explicitly since it's not exported from the orchestrator.
+func NewWithAudio(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebSocketHub, bus eventbus.Bus, sttClient stt.Client) *Server {
+	server := &Server{
+		mux:          http.NewServeMux(),
+		store:        store,
+		orchestrator: orch,
+		ws:           ws,
+		audioWS:      transport.NewAudioWebSocketHub(bus, orch, sttClient),
 	}
 	server.routes()
 	return server
@@ -45,6 +62,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /interview/{id}", s.getInterview)
 	s.mux.HandleFunc("POST /interview/{id}/transcript", s.completeTranscript)
 	s.mux.Handle("/ws", s.ws)
+
+	// Audio WebSocket endpoint — only registered if audioWS was set
+	if s.audioWS != nil {
+		s.mux.Handle("GET /interview/{id}/audio", s.audioWS)
+	}
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
