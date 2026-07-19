@@ -11,9 +11,12 @@ import (
 	"time"
 )
 
+var timeSleep = time.Sleep
+
 type GeminiClient struct {
 	apiKey  string
 	model   string
+	baseURL string
 	httpCli *http.Client
 }
 
@@ -24,11 +27,16 @@ func NewGeminiClient() *GeminiClient {
 	}
 	model := os.Getenv("GEMINI_MODEL")
 	if model == "" {
-		model = "gemini-2.0-flash"
+		model = "gemini-3.1-flash-lite"
+	}
+	baseURL := os.Getenv("GEMINI_BASE_URL")
+	if baseURL == "" {
+		baseURL = "https://generativelanguage.googleapis.com"
 	}
 	return &GeminiClient{
 		apiKey:  apiKey,
 		model:   model,
+		baseURL: baseURL,
 		httpCli: &http.Client{Timeout: 30 * time.Second},
 	}
 }
@@ -225,36 +233,73 @@ func (g *GeminiClient) generate(prompt string) (string, error) {
 		return "", fmt.Errorf("ai/gemini: marshal request: %w", err)
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", g.model, g.apiKey)
-	resp, err := g.httpCli.Post(url, "application/json", bytes.NewReader(payload))
-	if err != nil {
-		return "", fmt.Errorf("ai/gemini: http post: %w", err)
-	}
-	defer resp.Body.Close()
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", g.baseURL, g.model, g.apiKey)
 
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("ai/gemini: read response: %w", err)
+	var resp *http.Response
+	var lastErr error
+	maxRetries := 3
+	backoff := 1 * time.Second
+
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			timeSleep(backoff)
+			backoff *= 2
+		}
+
+		resp, err = g.httpCli.Post(url, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			lastErr = fmt.Errorf("http post: %w", err)
+			continue
+		}
+
+		raw, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response: %w", err)
+			continue
+		}
+
+		// Handle HTTP status codes
+		if resp.StatusCode != http.StatusOK {
+			var geminiResp geminiResponse
+			var errMsg string
+			if json.Unmarshal(raw, &geminiResp) == nil && geminiResp.Error != nil {
+				errMsg = geminiResp.Error.Message
+			} else {
+				errMsg = string(raw)
+			}
+
+			lastErr = fmt.Errorf("api status %d: %s", resp.StatusCode, errMsg)
+
+			// Retry only on 429 (Too Many Requests) or 5xx (Server Errors)
+			if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+				continue
+			}
+			// Non-retryable error
+			return "", fmt.Errorf("ai/gemini: %w", lastErr)
+		}
+
+		var geminiResp geminiResponse
+		if err := json.Unmarshal(raw, &geminiResp); err != nil {
+			return "", fmt.Errorf("ai/gemini: unmarshal response: %w", err)
+		}
+
+		if geminiResp.Error != nil {
+			return "", fmt.Errorf("ai/gemini: api error: %s", geminiResp.Error.Message)
+		}
+
+		if len(geminiResp.Candidates) == 0 {
+			return "", fmt.Errorf("ai/gemini: no candidates returned")
+		}
+
+		text := ""
+		for _, part := range geminiResp.Candidates[0].Content.Parts {
+			text += part.Text
+		}
+		return strings.TrimSpace(text), nil
 	}
 
-	var geminiResp geminiResponse
-	if err := json.Unmarshal(raw, &geminiResp); err != nil {
-		return "", fmt.Errorf("ai/gemini: unmarshal response: %w", err)
-	}
-
-	if geminiResp.Error != nil {
-		return "", fmt.Errorf("ai/gemini: api error: %s", geminiResp.Error.Message)
-	}
-
-	if len(geminiResp.Candidates) == 0 {
-		return "", fmt.Errorf("ai/gemini: no candidates returned")
-	}
-
-	text := ""
-	for _, part := range geminiResp.Candidates[0].Content.Parts {
-		text += part.Text
-	}
-	return strings.TrimSpace(text), nil
+	return "", fmt.Errorf("ai/gemini: failed after %d retries: %w", maxRetries, lastErr)
 }
 
 func stripMarkdown(raw string) string {
