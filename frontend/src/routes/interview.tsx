@@ -2,6 +2,16 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { ArchitectureDrawer } from "@/components/architecture-drawer";
 import { ScoreBar } from "@/components/score-bar";
+import {
+  endInterview,
+  getInterview,
+  interviewEventsURL,
+  scoreOverall,
+  submitTranscript,
+  type BackendEvent,
+  type Interview,
+} from "@/lib/backend";
+import { getInterviewId, saveSnapshot } from "@/lib/session";
 
 export const Route = createFileRoute("/interview")({
   head: () => ({
@@ -15,14 +25,17 @@ export const Route = createFileRoute("/interview")({
   component: InterviewRoom,
 });
 
-const question =
-  "Walk me through your experience scaling Kafka consumers for high-throughput event streams.";
-const transcript =
-  "In my last project, we handled 50k events/sec. We used partition-key strategies to ensure order while maintaining rebalance safety, then batched writes into Postgres via a small worker pool...";
-
 function InterviewRoom() {
   const nav = useNavigate();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [interviewId, setInterviewIdState] = useState<string | null>(null);
+  const [interview, setInterview] = useState<Interview | null>(null);
+  const [events, setEvents] = useState<BackendEvent[]>([]);
+  const [answer, setAnswer] = useState(
+    "I designed the event contracts first, then built an orchestrator that publishes immutable events. The tradeoff was accepting eventual consistency so question generation and scoring could run in parallel without blocking the live interview.",
+  );
+  const [status, setStatus] = useState("Connecting to backend...");
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -35,6 +48,92 @@ function InterviewRoom() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  useEffect(() => {
+    const id = getInterviewId();
+    setInterviewIdState(id);
+    if (!id) {
+      setStatus("No active interview. Start one from the dashboard.");
+      return;
+    }
+
+    let cancelled = false;
+    getInterview(id)
+      .then((snapshot) => {
+        if (cancelled) return;
+        setInterview(snapshot.interview);
+        setEvents(snapshot.timeline ?? []);
+        saveSnapshot(snapshot);
+        setStatus("Backend session active");
+      })
+      .catch((err) => setStatus(err instanceof Error ? err.message : "Could not load interview"));
+
+    const socket = new WebSocket(interviewEventsURL(id));
+    socket.onmessage = (message) => {
+      const event = JSON.parse(message.data) as BackendEvent;
+      setEvents((prev) => [...prev, event].slice(-80));
+      if (
+        event.type === "QuestionAsked" ||
+        event.type === "AnswerEvaluated" ||
+        event.type === "QuestionGenerated" ||
+        event.type === "InterviewFinished"
+      ) {
+        getInterview(id)
+          .then((snapshot) => {
+            setInterview(snapshot.interview);
+            saveSnapshot(snapshot);
+          })
+          .catch(() => {});
+      }
+    };
+    socket.onopen = () => setStatus("WebSocket stream healthy");
+    socket.onerror = () => setStatus("WebSocket stream interrupted");
+
+    return () => {
+      cancelled = true;
+      socket.close();
+    };
+  }, []);
+
+  async function submitAnswer() {
+    if (!interviewId || !answer.trim()) return;
+    setSubmitting(true);
+    setStatus("Publishing TranscriptCompleted...");
+    try {
+      const updated = await submitTranscript(interviewId, answer.trim());
+      setInterview(updated);
+      setAnswer("");
+      setStatus("Transcript published. Workers are evaluating in parallel.");
+      const snapshot = await getInterview(interviewId);
+      setInterview(snapshot.interview);
+      setEvents(snapshot.timeline ?? []);
+      saveSnapshot(snapshot);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Could not submit answer");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function finishInterview() {
+    if (!interviewId) {
+      nav({ to: "/results" });
+      return;
+    }
+    try {
+      const ended = await endInterview(interviewId);
+      setInterview(ended);
+      const snapshot = await getInterview(interviewId);
+      saveSnapshot(snapshot);
+      nav({ to: "/results" });
+    } catch {
+      nav({ to: "/results" });
+    }
+  }
+
+  const latestScore = interview?.scores?.at(-1);
+  const currentTranscript = interview?.transcript?.at(-1)?.answer ?? "Waiting for the candidate's next answer...";
+  const overall = scoreOverall(latestScore);
+
   return (
     <div className="min-h-screen bg-cockpit text-cockpit-foreground">
       {/* Minimal cockpit nav */}
@@ -43,12 +142,12 @@ function InterviewRoom() {
           <div className="size-6 rounded bg-brand" />
           <span className="text-sm font-semibold tracking-tight">Synapse</span>
           <span className="ml-3 font-mono text-[10px] uppercase tracking-widest text-cockpit-muted">
-            session · a4-2f19
+            session · {interview?.id ?? "pending"}
           </span>
         </Link>
         <div className="flex items-center gap-4 font-mono text-[10px] uppercase tracking-widest text-cockpit-muted">
           <span className="flex items-center gap-2">
-            <span className="size-1.5 rounded-full bg-brand animate-pulse" /> stream healthy
+            <span className="size-1.5 rounded-full bg-brand animate-pulse" /> {status}
           </span>
         </div>
       </nav>
@@ -76,10 +175,10 @@ function InterviewRoom() {
                     <p className="font-mono text-[10px] uppercase tracking-widest text-cockpit-muted">
                       Progress
                     </p>
-                    <p className="font-medium">Q3 / 10</p>
+                    <p className="font-medium">Q{interview?.question_number ?? 0} / 10</p>
                   </div>
                   <button
-                    onClick={() => nav({ to: "/results" })}
+                    onClick={() => void finishInterview()}
                     className="h-9 rounded-md bg-destructive/15 px-4 text-xs font-medium text-destructive ring-1 ring-destructive/30 hover:bg-destructive/20"
                   >
                     End interview
@@ -93,7 +192,7 @@ function InterviewRoom() {
                     Interviewer
                   </span>
                   <p className="max-w-[38ch] font-display text-3xl leading-tight text-cockpit-foreground text-balance">
-                    "{question}"
+                    "{interview?.current_question ?? "Start an interview from the dashboard to load the first question."}"
                   </p>
                 </div>
 
@@ -102,9 +201,28 @@ function InterviewRoom() {
                     Candidate transcript
                   </span>
                   <p className="text-base leading-relaxed text-cockpit-foreground/80">
-                    {transcript}
+                    {currentTranscript}
                     <span className="ml-1 inline-block h-4 w-[2px] translate-y-0.5 bg-brand animate-pulse" />
                   </p>
+                </div>
+              </div>
+
+              <div className="mb-6 space-y-3">
+                <textarea
+                  value={answer}
+                  onChange={(e) => setAnswer(e.target.value)}
+                  rows={4}
+                  className="w-full resize-none rounded-lg border border-cockpit-border bg-black/20 px-4 py-3 text-sm leading-relaxed text-cockpit-foreground outline-none placeholder:text-cockpit-muted focus:border-brand"
+                  placeholder="Type a candidate answer, then publish it as TranscriptCompleted."
+                />
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => void submitAnswer()}
+                    disabled={!interviewId || submitting || !answer.trim()}
+                    className="h-10 rounded-md bg-brand px-5 text-xs font-medium text-brand-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {submitting ? "Publishing..." : "Submit answer"}
+                  </button>
                 </div>
               </div>
 
@@ -131,13 +249,13 @@ function InterviewRoom() {
                   Real-time score
                 </p>
                 <p className="mt-1 font-display text-5xl font-semibold text-brand">
-                  82<span className="text-lg text-cockpit-muted">/100</span>
+                  {overall || "--"}<span className="text-lg text-cockpit-muted">/100</span>
                 </p>
               </div>
               <div className="space-y-4">
-                <ScoreBar label="TECHNICAL DEPTH" value={88} />
-                <ScoreBar label="COMMUNICATION" value={74} />
-                <ScoreBar label="PROBLEM SOLVING" value={81} tone="signal" />
+                <ScoreBar label="TECHNICAL DEPTH" value={(latestScore?.technical_depth ?? 0) * 10} />
+                <ScoreBar label="COMMUNICATION" value={(latestScore?.communication ?? 0) * 10} />
+                <ScoreBar label="CONFIDENCE" value={(latestScore?.confidence ?? 0) * 10} tone="signal" />
               </div>
             </div>
 
@@ -165,28 +283,18 @@ function InterviewRoom() {
                 Question queue
               </p>
               <ol className="space-y-2 font-mono text-xs">
-                <li className="flex justify-between text-cockpit-foreground/50 line-through">
-                  <span>01 · Kafka consumer basics</span><span>✓</span>
-                </li>
-                <li className="flex justify-between text-cockpit-foreground/50 line-through">
-                  <span>02 · Partition strategy</span><span>✓</span>
-                </li>
-                <li className="flex justify-between text-brand">
-                  <span>03 · High-throughput scaling</span><span>●</span>
-                </li>
-                <li className="flex justify-between text-cockpit-muted">
-                  <span>04 · Retry semantics</span><span>—</span>
-                </li>
-                <li className="flex justify-between text-cockpit-muted">
-                  <span>05 · Caching layer</span><span>—</span>
-                </li>
+                {(interview?.question_buffer?.length ? interview.question_buffer : [interview?.current_question ?? "Waiting for first question"]).map((item, index) => (
+                  <li key={`${item}-${index}`} className={index === 0 ? "flex justify-between text-brand" : "flex justify-between text-cockpit-muted"}>
+                    <span>{String(index + 1).padStart(2, "0")} · {item}</span><span>{index === 0 ? "●" : "—"}</span>
+                  </li>
+                ))}
               </ol>
             </div>
           </aside>
         </div>
       </main>
 
-      <ArchitectureDrawer open={drawerOpen} onOpenChange={setDrawerOpen} />
+      <ArchitectureDrawer open={drawerOpen} onOpenChange={setDrawerOpen} interviewId={interviewId} events={events} />
     </div>
   );
 }

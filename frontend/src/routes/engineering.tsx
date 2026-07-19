@@ -2,7 +2,9 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { EventStream } from "@/components/event-stream";
 import { PipelineDiagram } from "@/components/pipeline-diagram";
+import { getInterview, type BackendEvent } from "@/lib/backend";
 import { workers } from "@/lib/mock";
+import { getInterviewId, saveSnapshot } from "@/lib/session";
 
 export const Route = createFileRoute("/engineering")({
   head: () => ({
@@ -23,6 +25,21 @@ export const Route = createFileRoute("/engineering")({
 });
 
 function Engineering() {
+  const [interviewId, setInterviewId] = useState<string | null>(null);
+  const [events, setEvents] = useState<BackendEvent[]>([]);
+
+  useEffect(() => {
+    const id = getInterviewId();
+    setInterviewId(id);
+    if (!id) return;
+    getInterview(id)
+      .then((snapshot) => {
+        setEvents(snapshot.timeline ?? []);
+        saveSnapshot(snapshot);
+      })
+      .catch(() => {});
+  }, []);
+
   return (
     <div className="min-h-screen bg-cockpit text-cockpit-foreground">
       <nav className="flex items-center justify-between border-b border-cockpit-border px-6 py-4">
@@ -100,7 +117,7 @@ function Engineering() {
             </p>
           </div>
           <div className="max-h-[360px] overflow-y-auto rounded-lg bg-black/40 p-5">
-            <EventStream />
+            <EventStream interviewId={interviewId} initialEvents={events} />
           </div>
         </section>
       </main>
