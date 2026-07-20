@@ -60,7 +60,7 @@ func (o *Orchestrator) StartInterview(ctx context.Context, req StartRequest) (mo
 		return models.Interview{}, err
 	}
 
-	interview, err = o.askQuestion(ctx, interview.ID, question)
+	interview, err = o.AskQuestion(ctx, interview.ID, question)
 	if err != nil {
 		return models.Interview{}, err
 	}
@@ -127,7 +127,7 @@ func (o *Orchestrator) ApplyGeneratedQuestion(ctx context.Context, interviewID s
 		return interview, nil
 	}
 
-	return o.askQuestion(ctx, interviewID, question)
+	return o.AskQuestion(ctx, interviewID, question)
 }
 
 func (o *Orchestrator) ApplyEvaluation(interviewID string, score models.Score) (models.Interview, error) {
@@ -137,7 +137,7 @@ func (o *Orchestrator) ApplyEvaluation(interviewID string, score models.Score) (
 	})
 }
 
-func (o *Orchestrator) askQuestion(ctx context.Context, interviewID string, question string) (models.Interview, error) {
+func (o *Orchestrator) AskQuestion(ctx context.Context, interviewID string, question string) (models.Interview, error) {
 	interview, err := o.store.UpdateInterview(interviewID, func(interview *models.Interview) error {
 		interview.CurrentQuestion = question
 		interview.QuestionNumber++

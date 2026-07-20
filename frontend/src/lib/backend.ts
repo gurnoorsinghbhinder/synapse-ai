@@ -28,11 +28,26 @@ export type BackendEvent = {
   metadata?: Record<string, string>;
 };
 
+export type CandidateProject = {
+  name: string;
+  stack: string;
+  impact: string;
+};
+
+export type CandidateExp = {
+  role: string;
+  company: string;
+  years: string;
+};
+
 export type Candidate = {
   id: string;
   name: string;
   email: string;
   resume_text: string;
+  skills?: string[];
+  projects?: CandidateProject[];
+  experience?: CandidateExp[];
   created_at: string;
 };
 
@@ -156,6 +171,14 @@ export function submitTranscript(interviewId: string, text: string) {
 
 export function interviewEventsURL(interviewId: string) {
   return `${WS_BASE}/ws?interview_id=${encodeURIComponent(interviewId)}`;
+}
+
+export function audioStreamURL(interviewId: string) {
+  return `${WS_BASE}/interview/${encodeURIComponent(interviewId)}/audio`;
+}
+
+export function getCandidate(candidateId: string) {
+  return request<Candidate>(`/candidate/${candidateId}`);
 }
 
 export function scoreOverall(score?: Score) {

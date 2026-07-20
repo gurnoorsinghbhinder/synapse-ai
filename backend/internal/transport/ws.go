@@ -141,3 +141,29 @@ func writeTextFrame(rw *bufio.ReadWriter, payload []byte) error {
 	_, err := rw.Write(payload)
 	return err
 }
+
+func writeBinaryFrame(rw *bufio.ReadWriter, payload []byte) error {
+	header := []byte{0x82} // binary frame opcode
+	length := len(payload)
+	if length < 126 {
+		header = append(header, byte(length))
+	} else if length <= 65535 {
+		header = append(header, 126, byte(length>>8), byte(length))
+	} else {
+		header = append(header, 127,
+			byte(length>>56),
+			byte(length>>48),
+			byte(length>>40),
+			byte(length>>32),
+			byte(length>>24),
+			byte(length>>16),
+			byte(length>>8),
+			byte(length),
+		)
+	}
+	if _, err := rw.Write(header); err != nil {
+		return err
+	}
+	_, err := rw.Write(payload)
+	return err
+}

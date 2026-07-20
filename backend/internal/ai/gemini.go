@@ -61,8 +61,9 @@ type geminiPart struct {
 }
 
 type geminiGenerationConfig struct {
-	Temperature     float64 `json:"temperature,omitempty"`
-	MaxOutputTokens int     `json:"maxOutputTokens,omitempty"`
+	Temperature      float64 `json:"temperature,omitempty"`
+	MaxOutputTokens  int     `json:"maxOutputTokens,omitempty"`
+	ResponseMimeType string  `json:"responseMimeType,omitempty"`
 }
 
 type geminiResponse struct {
@@ -225,6 +226,122 @@ func (g *GeminiClient) generate(prompt string) (string, error) {
 		GenerationConfig: &geminiGenerationConfig{
 			Temperature:     0.7,
 			MaxOutputTokens: 1024,
+		},
+	}
+
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("ai/gemini: marshal request: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/v1beta/models/%s:generateContent?key=%s", g.baseURL, g.model, g.apiKey)
+
+	var resp *http.Response
+	var lastErr error
+	maxRetries := 3
+	backoff := 1 * time.Second
+
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			timeSleep(backoff)
+			backoff *= 2
+		}
+
+		resp, err = g.httpCli.Post(url, "application/json", bytes.NewReader(payload))
+		if err != nil {
+			lastErr = fmt.Errorf("http post: %w", err)
+			continue
+		}
+
+		raw, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response: %w", err)
+			continue
+		}
+
+		// Handle HTTP status codes
+		if resp.StatusCode != http.StatusOK {
+			var geminiResp geminiResponse
+			var errMsg string
+			if json.Unmarshal(raw, &geminiResp) == nil && geminiResp.Error != nil {
+				errMsg = geminiResp.Error.Message
+			} else {
+				errMsg = string(raw)
+			}
+
+			lastErr = fmt.Errorf("api status %d: %s", resp.StatusCode, errMsg)
+
+			// Retry only on 429 (Too Many Requests) or 5xx (Server Errors)
+			if resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode <= 599) {
+				continue
+			}
+			// Non-retryable error
+			return "", fmt.Errorf("ai/gemini: %w", lastErr)
+		}
+
+		var geminiResp geminiResponse
+		if err := json.Unmarshal(raw, &geminiResp); err != nil {
+			return "", fmt.Errorf("ai/gemini: unmarshal response: %w", err)
+		}
+
+		if geminiResp.Error != nil {
+			return "", fmt.Errorf("ai/gemini: api error: %s", geminiResp.Error.Message)
+		}
+
+		if len(geminiResp.Candidates) == 0 {
+			return "", fmt.Errorf("ai/gemini: no candidates returned")
+		}
+
+		text := ""
+		for _, part := range geminiResp.Candidates[0].Content.Parts {
+			text += part.Text
+		}
+		return strings.TrimSpace(text), nil
+	}
+
+	return "", fmt.Errorf("ai/gemini: failed after %d retries: %w", maxRetries, lastErr)
+}
+
+func (g *GeminiClient) ParseResume(resumeText string) (CandidateProfile, error) {
+	prompt := fmt.Sprintf(`Extract the candidate name, email address, technical skills, projects, and work experience from this resume text.
+Return a structured JSON object strictly matching this schema:
+{
+  "name": "string",
+  "email": "string",
+  "skills": ["string", "string"],
+  "projects": [{"name": "string", "stack": "string", "impact": "string"}],
+  "experience": [{"role": "string", "company": "string", "years": "string"}]
+}
+
+Resume Text:
+%s`, resumeText)
+
+	raw, err := g.generateJSON(prompt)
+	if err != nil {
+		return CandidateProfile{}, err
+	}
+
+	var profile CandidateProfile
+	if err := json.Unmarshal([]byte(raw), &profile); err != nil {
+		return CandidateProfile{}, fmt.Errorf("ai/gemini: unmarshal parsed profile: %w", err)
+	}
+
+	return profile, nil
+}
+
+func (g *GeminiClient) generateJSON(prompt string) (string, error) {
+	body := geminiRequest{
+		Contents: []geminiContent{
+			{
+				Role:  "user",
+				Parts: []geminiPart{{Text: prompt}},
+			},
+		},
+		GenerationConfig: &geminiGenerationConfig{
+			Temperature:      0.2,
+			MaxOutputTokens:  2048,
+			ResponseMimeType: "application/json",
 		},
 	}
 

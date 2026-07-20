@@ -1,300 +1,477 @@
 /**
- * AudioStream manages a WebSocket connection to the backend's
- * /interview/:id/audio endpoint. It:
+ * AudioStream — Robust Speech-to-Text via WebSocket audio streaming.
  *
- * 1. Captures microphone input via the MediaStream Recording API
- * 2. Streams raw PCM audio chunks (16-bit mono 16kHz) over the WebSocket
- * 3. Receives interim TranscriptChunk events for near-real-time feedback
- * 4. Detects silence client-side and sends force_complete when appropriate
- * 5. Receives TranscriptCompleted confirmation from the backend
+ * Instead of relying on the notoriously unreliable webkitSpeechRecognition API,
+ * this module:
+ * 1. Captures microphone audio via Web Audio API (raw PCM 16-bit 16kHz mono)
+ * 2. Streams raw PCM audio chunks to the backend via a dedicated WebSocket
+ * 3. Receives transcription results (interim + final) from the backend's STT pipeline
+ *
+ * NOTE: This uses AudioContext + ScriptProcessorNode to capture raw PCM audio,
+ * NOT MediaRecorder (which outputs WebM chunks). The backend expects raw PCM
+ * as documented by the "AudioConnected" message.
  */
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
+export interface AudioStreamCallbacks {
+  /** Called with interim transcription text as the user speaks */
+  onInterimTranscript?: (text: string) => void;
+  /** Called when a complete utterance has been transcribed */
+  onFinalTranscript?: (text: string) => void;
+  /** Called when the connection state changes */
+  onStatusChange?: (status: AudioStreamStatus) => void;
+  /** Called on error */
+  onError?: (error: string) => void;
+}
 
-const WS_BASE =
-  import.meta.env.VITE_WS_BASE_URL ??
-  (API_BASE ?? "http://localhost:8080").replace(/^http/, "ws");
-
-export type AudioStreamEvent =
-  | { type: "AudioConnected"; message: string }
-  | { type: "TranscriptChunk"; text: string; final: boolean; offset: number }
-  | { type: "TranscriptCompleted"; text: string; length: number }
-  | { type: "AudioError"; error: string };
-
-export type AudioStreamCallbacks = {
-  onEvent: (event: AudioStreamEvent) => void;
-  onError?: (error: Error) => void;
-  onStateChange?: (state: AudioStreamState) => void;
-};
-
-export type AudioStreamState =
-  | "idle"
-  | "connecting"
-  | "connected"
-  | "recording"
-  | "processing"
-  | "disconnected"
-  | "error";
+export interface AudioStreamStatus {
+  connected: boolean;
+  listening: boolean;
+  error: string | null;
+}
 
 export class AudioStream {
   private ws: WebSocket | null = null;
-  private mediaRecorder: MediaRecorder | null = null;
-  private audioContext: AudioContext | null = null;
   private stream: MediaStream | null = null;
-  private interviewId: string;
+  private audioContext: AudioContext | null = null;
+  private scriptNode: ScriptProcessorNode | null = null;
+  private sourceNode: MediaStreamAudioSourceNode | null = null;
+
+  private wsUrl: string;
   private callbacks: AudioStreamCallbacks;
-  private state: AudioStreamState = "idle";
+  private _listening = false;
+  private _connected = false;
   private reconnectAttempts = 0;
   private maxReconnectAttempts = 3;
-  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastAudioLevel = 0;
-  private silenceThreshold = 0.02; // RMS threshold for silence detection
-  private silenceDurationMs = 0;
-  private silenceTimeoutMs = 3000; // 3s of silence = utterance complete
-  private readonly CHUNK_INTERVAL_MS = 1000; // send chunks every 1s
-  private chunkInterval: ReturnType<typeof setInterval> | null = null;
-  private analyserNode: AnalyserNode | null = null;
+  private reconnectDelay = 1000;
+  private shouldReconnect = false;
+  private wsOpenPromiseResolve: (() => void) | null = null;
+  private wsOpenPromiseReject: ((err: Error) => void) | null = null;
+  private wsTimeoutId: ReturnType<typeof setTimeout> | null = null;
+
+  /** Accumulated final transcript from this session */
+  private accumulatedText = "";
+
+  /** Raw PCM buffer to send as a single chunk on stop */
+  private pcmBuffer: Int16Array[] = [];
+  private actualSampleRate: number = 16000;
 
   constructor(interviewId: string, callbacks: AudioStreamCallbacks) {
-    this.interviewId = interviewId;
+    const base =
+      import.meta.env.VITE_WS_BASE_URL ??
+      (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080").replace(/^http/, "ws");
+    this.wsUrl = `${base}/interview/${encodeURIComponent(interviewId)}/audio`;
     this.callbacks = callbacks;
+    console.log(`[AudioStream] Created for interview ${interviewId}, WS URL: ${this.wsUrl}`);
   }
 
-  get currentState(): AudioStreamState {
-    return this.state;
+  get listening(): boolean {
+    return this._listening;
   }
 
-  private setState(newState: AudioStreamState) {
-    this.state = newState;
-    this.callbacks.onStateChange?.(newState);
+  get connected(): boolean {
+    return this._connected;
+  }
+
+  get transcript(): string {
+    return this.accumulatedText;
   }
 
   /**
-   * Start the audio stream: connect WebSocket, request mic, begin recording.
+   * Start streaming audio to the backend for transcription.
+   * Captures raw PCM via Web Audio API and streams to WebSocket.
    */
   async start(): Promise<void> {
-    if (this.state !== "idle" && this.state !== "disconnected") {
-      throw new Error(`Cannot start from state: ${this.state}`);
+    if (this._listening) {
+      console.log("[AudioStream] Already listening, ignoring start()");
+      return;
     }
 
-    this.setState("connecting");
-    this.reconnectAttempts = 0;
+    console.log("[AudioStream] Starting audio capture (raw PCM mode)...");
 
     try {
+      // 1. Request microphone access
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      console.log("[AudioStream] Microphone access granted");
+
+      // 2. Create AudioContext for PCM capture
+      this.audioContext = new AudioContext();
+
+      // 3. Connect WebSocket
+      this.shouldReconnect = true;
+      this.reconnectAttempts = 0;
       await this.connectWebSocket();
-      await this.startMicrophone();
-      this.setState("recording");
+
+      // 4. Start raw PCM capture via ScriptProcessorNode
+      this.startPCMCapture();
+
+      this._listening = true;
+      this.pcmBuffer = [];
+      this.accumulatedText = "";
+      this.emitStatus();
+      console.log("[AudioStream] Audio capture started successfully");
     } catch (err) {
-      this.setState("error");
-      throw err;
+      console.error("[AudioStream] Failed to start:", err);
+      const message = err instanceof DOMException && err.name === "NotAllowedError"
+        ? "Microphone access denied. Please check site permissions."
+        : err instanceof DOMException && err.name === "NotFoundError"
+          ? "No microphone found. Please connect a microphone."
+          : err instanceof Error
+            ? err.message
+            : "Failed to start audio capture";
+      this.callbacks.onError?.(message);
+      this.emitStatus();
+      this.cleanup();
     }
   }
 
   /**
-   * Stop the audio stream gracefully.
+   * Stop listening and flush any pending audio.
    */
   stop(): void {
-    this.stopMicrophone();
-    this.closeWebSocket();
-    this.setState("disconnected");
+    console.log("[AudioStream] Stopping audio capture...");
+    this._listening = false;
+    this.shouldReconnect = false;
+
+    // Stop PCM capture
+    this.stopPCMCapture();
+
+    // Send any remaining buffered PCM data as final chunk
+    this.flushPCMBuffer();
+
+    // Send force_complete to finalize the utterance
+    if (this.ws && this._connected) {
+      try {
+        this.ws.send(JSON.stringify({ type: "force_complete" }));
+        console.log("[AudioStream] Sent force_complete");
+      } catch (e) {
+        console.warn("[AudioStream] Could not send force_complete:", e);
+      }
+    }
+
+    // Close WebSocket after enough time for finalize to process
+    setTimeout(() => {
+      this.cleanup();
+      this.emitStatus();
+      console.log("[AudioStream] Audio capture stopped and cleaned up");
+    }, 1500);
   }
 
   /**
-   * Manually signal that the user has finished speaking.
-   * This sends a force_complete control message to the backend.
+   * Manually finalize the current utterance (like pressing "Done speaking").
    */
   forceComplete(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.ws && this._connected) {
+      this.flushPCMBuffer();
       this.ws.send(JSON.stringify({ type: "force_complete" }));
-      this.setState("processing");
     }
   }
 
   /**
-   * Adjust the silence detection threshold.
-   * Lower values = more sensitive (detects silence sooner).
-   * @param threshold RMS value between 0 and 1 (default 0.02)
+   * Reset accumulated transcript for a new question.
    */
-  setSilenceThreshold(threshold: number): void {
-    this.silenceThreshold = Math.max(0, Math.min(1, threshold));
+  resetTranscript(): void {
+    this.accumulatedText = "";
   }
 
   /**
-   * Adjust the silence timeout duration.
-   * @param ms milliseconds of silence before auto-completing (default 3000)
+   * Clean up all resources.
    */
-  setSilenceTimeout(ms: number): void {
-    this.silenceTimeoutMs = ms;
+  destroy(): void {
+    console.log("[AudioStream] Destroying audio stream...");
+    this.shouldReconnect = false;
+    this.cleanup();
+    this.callbacks = {};
+    console.log("[AudioStream] Destroyed");
   }
 
-  private async connectWebSocket(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const url = `${WS_BASE}/interview/${encodeURIComponent(this.interviewId)}/audio`;
-      this.ws = new WebSocket(url);
+  // ─── Private: Raw PCM Capture via Web Audio API ─────────────────────
 
-      this.ws.onopen = () => {
-        this.setState("connected");
-        this.reconnectAttempts = 0;
-        resolve();
-      };
-
-      this.ws.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data) as AudioStreamEvent;
-          this.callbacks.onEvent(data);
-
-          // If we get a TranscriptCompleted, we can start recording again
-          if (data.type === "TranscriptCompleted") {
-            this.setState("recording");
-          }
-        } catch {
-          // Binary data (audio echo from server) — ignore
-        }
-      };
-
-      this.ws.onerror = () => {
-        this.callbacks.onError?.(new Error("WebSocket error"));
-      };
-
-      this.ws.onclose = () => {
-        if (this.state === "connecting") {
-          reject(new Error("WebSocket connection failed"));
-        }
-        this.handleDisconnect();
-      };
-
-      // Timeout if connection takes too long
-      setTimeout(() => {
-        if (this.ws?.readyState !== WebSocket.OPEN) {
-          this.ws?.close();
-          reject(new Error("WebSocket connection timeout"));
-        }
-      }, 5000);
-    });
-  }
-
-  private async startMicrophone(): Promise<void> {
-    // Request microphone access
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        sampleRate: 16000,
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    });
-
-    // Set up audio context for silence detection
-    this.audioContext = new AudioContext({ sampleRate: 16000 });
-    const source = this.audioContext.createMediaStreamSource(this.stream);
-    this.analyserNode = this.audioContext.createAnalyser();
-    this.analyserNode.fftSize = 256;
-    source.connect(this.analyserNode);
-
-    // Use MediaRecorder to capture raw PCM chunks
-    // We use audio/webm; codecs=opus and then decode to PCM on the backend,
-    // OR we can use the AudioContext to get raw PCM directly.
-    // For simplicity, we use MediaRecorder with opus and let the backend
-    // handle decoding. But the backend expects raw PCM 16-bit mono 16kHz.
-    //
-    // To get raw PCM, we use AudioWorklet or ScriptProcessorNode.
-    // ScriptProcessorNode is deprecated but widely supported.
-    this.startPCMCapture();
-
-    // Start the silence detection loop
-    this.startSilenceDetection();
-  }
-
-  private startPCMCapture(): void {
+  private startPCMCapture() {
     if (!this.audioContext || !this.stream) return;
 
-    // Use ScriptProcessorNode to get raw PCM data
-    const processor = this.audioContext.createScriptProcessor(4096, 1, 1);
-    const source = this.audioContext.createMediaStreamSource(this.stream);
-    source.connect(processor);
-    processor.connect(this.audioContext.destination);
+    const sampleRate = this.audioContext.sampleRate;
+    this.actualSampleRate = sampleRate;
+    console.log(`[AudioStream] Starting PCM capture at ${sampleRate}Hz${sampleRate !== 16000 ? ` (will downsample to 16kHz)` : ''}`);
 
-    processor.onaudioprocess = (event) => {
-      if (this.ws?.readyState !== WebSocket.OPEN) return;
+    // Create source from mic
+    this.sourceNode = this.audioContext.createMediaStreamSource(this.stream);
 
-      const inputData = event.inputBuffer.getChannelData(0);
-      // Convert Float32 to Int16 PCM
-      const pcmData = new Int16Array(inputData.length);
-      for (let i = 0; i < inputData.length; i++) {
-        // Clamp to [-1, 1] and convert to Int16
-        const sample = Math.max(-1, Math.min(1, inputData[i]));
-        pcmData[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-      }
+    // ScriptProcessorNode for raw PCM access
+    // Buffer size: 4096 frames, ~85ms at 48kHz, ~256ms at 16kHz
+    this.scriptNode = this.audioContext.createScriptProcessor(4096, 1, 1);
 
-      // Send as binary WebSocket frame
-      this.ws?.send(pcmData.buffer);
+    this.scriptNode.onaudioprocess = (event: AudioProcessingEvent) => {
+      if (!this._listening || !this._connected) return;
 
-      // Calculate RMS for silence detection
-      let sumSquares = 0;
-      for (let i = 0; i < inputData.length; i++) {
-        sumSquares += inputData[i] * inputData[i];
-      }
-      this.lastAudioLevel = Math.sqrt(sumSquares / inputData.length);
-    };
-  }
-
-  private startSilenceDetection(): void {
-    // Check audio levels every 200ms
-    this.chunkInterval = setInterval(() => {
-      if (this.lastAudioLevel < this.silenceThreshold) {
-        this.silenceDurationMs += 200;
+      const input = event.inputBuffer.getChannelData(0); // Float32 samples
+      
+      // Downsample to 16kHz for consistent STT processing
+      let float16k: Float32Array;
+      if (sampleRate === 16000) {
+        float16k = input;
       } else {
-        this.silenceDurationMs = 0;
+        // Simple decimation: take every Nth sample
+        const ratio = sampleRate / 16000;
+        const outputLen = Math.floor(input.length / ratio);
+        float16k = new Float32Array(outputLen);
+        for (let i = 0; i < outputLen; i++) {
+          float16k[i] = input[Math.floor(i * ratio)];
+        }
       }
 
-      // If silence exceeds threshold, auto-complete
-      if (this.silenceDurationMs >= this.silenceTimeoutMs && this.state === "recording") {
-        this.forceComplete();
+      // Convert to 16-bit PCM and buffer it
+      const pcm16 = this.float32ToInt16(float16k);
+      this.pcmBuffer.push(pcm16);
+
+      // Send every 4 bufferfuls to keep latency reasonable
+      // At 4096 input frames @ 48kHz → ~170ms per batch → ~85ms output at 16kHz
+      // 4 batches = ~340ms chunks (good balance of latency vs chunk overhead)
+      if (this.pcmBuffer.length >= 4) {
+        this.flushPCMBuffer();
       }
-    }, 200);
+    };
+
+    this.sourceNode.connect(this.scriptNode);
+    this.scriptNode.connect(this.audioContext.destination);
+    console.log("[AudioStream] PCM capture nodes connected");
   }
 
-  private handleDisconnect(): void {
-    this.stopMicrophone();
-    this.setState("disconnected");
-
-    // Auto-reconnect if not intentionally stopped
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      this.reconnectAttempts++;
-      setTimeout(() => {
-        this.connectWebSocket().catch(() => {});
-      }, 1000 * this.reconnectAttempts);
+  private stopPCMCapture() {
+    if (this.scriptNode) {
+      this.scriptNode.disconnect();
+      this.scriptNode = null;
+    }
+    if (this.sourceNode) {
+      this.sourceNode.disconnect();
+      this.sourceNode = null;
     }
   }
 
-  private stopMicrophone(): void {
-    if (this.chunkInterval) {
-      clearInterval(this.chunkInterval);
-      this.chunkInterval = null;
+  private flushPCMBuffer() {
+    if (this.pcmBuffer.length === 0 || !this.ws || !this._connected) return;
+
+    // Concatenate all buffered PCM16 arrays
+    let totalLength = 0;
+    for (const buf of this.pcmBuffer) {
+      totalLength += buf.length;
     }
-    if (this.silenceTimer) {
-      clearTimeout(this.silenceTimer);
-      this.silenceTimer = null;
+
+    const combined = new Int16Array(totalLength);
+    let offset = 0;
+    for (const buf of this.pcmBuffer) {
+      combined.set(buf, offset);
+      offset += buf.length;
     }
-    if (this.mediaRecorder) {
-      this.mediaRecorder.stop();
-      this.mediaRecorder = null;
+
+    this.pcmBuffer = [];
+
+    // Send as raw binary (Int16Array -> ArrayBuffer)
+    this.ws.send(combined.buffer);
+    console.log(`[AudioStream] Sent PCM chunk: ${combined.length} samples (${combined.buffer.byteLength} bytes)`);
+  }
+
+  private float32ToInt16(float32: Float32Array): Int16Array {
+    const int16 = new Int16Array(float32.length);
+    for (let i = 0; i < float32.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32[i]));
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
-    if (this.stream) {
-      this.stream.getTracks().forEach((t) => t.stop());
-      this.stream = null;
+    return int16;
+  }
+
+  // ─── Private: WebSocket ─────────────────────────────────────────────
+
+  private connectWebSocket(): Promise<void> {
+    // Clear any stale timeout from previous connection
+    if (this.wsTimeoutId) {
+      clearTimeout(this.wsTimeoutId);
+      this.wsTimeoutId = null;
     }
+
+    return new Promise((resolve, reject) => {
+      this.wsOpenPromiseResolve = resolve;
+      this.wsOpenPromiseReject = reject;
+
+      try {
+        console.log(`[AudioStream] Opening WebSocket to ${this.wsUrl}`);
+        this.ws = new WebSocket(this.wsUrl);
+      } catch (err) {
+        console.error("[AudioStream] WebSocket creation failed:", err);
+        reject(err);
+        return;
+      }
+
+      this.ws.binaryType = "arraybuffer";
+
+      this.ws.onopen = () => {
+        console.log("[AudioStream] WebSocket opened successfully");
+        this._connected = true;
+        this.reconnectAttempts = 0;
+        this.emitStatus();
+
+        // Resolve the pending promise
+        if (this.wsOpenPromiseResolve) {
+          this.wsOpenPromiseResolve();
+          this.wsOpenPromiseResolve = null;
+          this.wsOpenPromiseReject = null;
+        }
+        if (this.wsTimeoutId) {
+          clearTimeout(this.wsTimeoutId);
+          this.wsTimeoutId = null;
+        }
+      };
+
+      this.ws.onmessage = (event: MessageEvent) => {
+        this.handleMessage(event);
+      };
+
+      this.ws.onerror = (err) => {
+        console.error("[AudioStream] WebSocket error:", err);
+      };
+
+      this.ws.onclose = (event) => {
+        console.log(`[AudioStream] WebSocket closed (code=${event.code}, reason=${event.reason})`);
+        this._connected = false;
+        this.emitStatus();
+
+        // If the promise is still pending (connection never fully opened), reject it
+        if (this.wsOpenPromiseReject) {
+          this.wsOpenPromiseReject(new Error(`WebSocket closed during connect: code=${event.code}`));
+          this.wsOpenPromiseResolve = null;
+          this.wsOpenPromiseReject = null;
+        }
+
+        if (this.shouldReconnect && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++;
+          const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+          console.log(`[AudioStream] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+          setTimeout(() => {
+            if (this.shouldReconnect) {
+              this.connectWebSocket().catch(() => {});
+            }
+          }, delay);
+        }
+      };
+
+      // Timeout: reject if connection doesn't open within 10 seconds
+      this.wsTimeoutId = setTimeout(() => {
+        if (!this._connected) {
+          console.error("[AudioStream] WebSocket connection timed out after 10s");
+          if (this.wsOpenPromiseReject) {
+            this.wsOpenPromiseReject(new Error("WebSocket connection timed out"));
+            this.wsOpenPromiseResolve = null;
+            this.wsOpenPromiseReject = null;
+          }
+        }
+        this.wsTimeoutId = null;
+      }, 10000);
+    });
+  }
+
+  // ─── Private: Message Handling ──────────────────────────────────────
+
+  private handleMessage(event: MessageEvent) {
+    // Ignore binary frames (they're audio responses from Gemini Live)
+    if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+      return;
+    }
+
+    try {
+      const data = JSON.parse(event.data as string);
+      console.log("[AudioStream] Received:", data.type, data.text ? `"${data.text.slice(0, 60)}..."` : "");
+      
+      switch (data.type) {
+        case "AudioConnected":
+          console.log("[AudioStream] Backend ready:", data.message);
+          break;
+
+        case "TranscriptChunk":
+          if (data.text && !data.final) {
+            const interimText = this.accumulatedText
+              ? this.accumulatedText + " " + data.text
+              : data.text;
+            this.callbacks.onInterimTranscript?.(interimText);
+          }
+          if (data.text && data.final === true) {
+            if (this.accumulatedText) {
+              this.accumulatedText += " " + data.text;
+            } else {
+              this.accumulatedText = data.text;
+            }
+            this.callbacks.onFinalTranscript?.(this.accumulatedText);
+          }
+          break;
+
+        case "TranscriptCompleted":
+          if (data.text) {
+            this.accumulatedText = data.text;
+            this.callbacks.onFinalTranscript?.(this.accumulatedText);
+          }
+          break;
+
+        default:
+          break;
+      }
+    } catch (e) {
+      console.warn("[AudioStream] Failed to parse message:", e);
+    }
+  }
+
+  // ─── Private: Cleanup ───────────────────────────────────────────────
+
+  private cleanup() {
+    // Clear timeout
+    if (this.wsTimeoutId) {
+      clearTimeout(this.wsTimeoutId);
+      this.wsTimeoutId = null;
+    }
+    this.wsOpenPromiseResolve = null;
+    this.wsOpenPromiseReject = null;
+
+    // Stop PCM capture
+    this.stopPCMCapture();
+
+    // Close AudioContext
     if (this.audioContext) {
       this.audioContext.close().catch(() => {});
       this.audioContext = null;
     }
-  }
 
-  private closeWebSocket(): void {
+    // Stop media tracks
+    if (this.stream) {
+      this.stream.getTracks().forEach((t) => {
+        console.log(`[AudioStream] Stopping track: ${t.kind}`);
+        t.stop();
+      });
+      this.stream = null;
+    }
+
+    // Close WebSocket
     if (this.ws) {
-      this.ws.onclose = null; // prevent reconnect
-      this.ws.close();
+      const state = this.ws.readyState;
+      if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+        console.log("[AudioStream] Closing WebSocket...");
+        this.ws.close(1000, "Client disconnecting");
+      }
       this.ws = null;
     }
+
+    this._connected = false;
+    this._listening = false;
+    this.pcmBuffer = [];
+  }
+
+  private emitStatus() {
+    this.callbacks.onStatusChange?.({
+      connected: this._connected,
+      listening: this._listening,
+      error: null,
+    });
   }
 }

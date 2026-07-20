@@ -8,9 +8,10 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/lib/pq"
 	"intervue/backend/shared/events"
 	"intervue/backend/shared/models"
+
+	_ "github.com/lib/pq"
 )
 
 var ErrNotFound = errors.New("not found")
@@ -69,6 +70,10 @@ func (s *Store) bootstrap() error {
 		created_at TIMESTAMPTZ NOT NULL
 	);
 
+	ALTER TABLE candidates ADD COLUMN IF NOT EXISTS skills JSONB NOT NULL DEFAULT '[]'::jsonb;
+	ALTER TABLE candidates ADD COLUMN IF NOT EXISTS projects JSONB NOT NULL DEFAULT '[]'::jsonb;
+	ALTER TABLE candidates ADD COLUMN IF NOT EXISTS experience JSONB NOT NULL DEFAULT '[]'::jsonb;
+
 	CREATE TABLE IF NOT EXISTS interviews (
 		id TEXT PRIMARY KEY,
 		candidate_id TEXT NOT NULL REFERENCES candidates(id),
@@ -106,15 +111,22 @@ func (s *Store) SaveCandidate(candidate models.Candidate) models.Candidate {
 	}
 
 	if s.db != nil {
+		skillsJSON, _ := json.Marshal(candidate.Skills)
+		projectsJSON, _ := json.Marshal(candidate.Projects)
+		expJSON, _ := json.Marshal(candidate.Experience)
+
 		query := `
-			INSERT INTO candidates (id, name, email, resume_text, created_at)
-			VALUES ($1, $2, $3, $4, $5)
+			INSERT INTO candidates (id, name, email, resume_text, skills, projects, experience, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			ON CONFLICT (id) DO UPDATE SET
 				name = EXCLUDED.name,
 				email = EXCLUDED.email,
-				resume_text = EXCLUDED.resume_text
+				resume_text = EXCLUDED.resume_text,
+				skills = EXCLUDED.skills,
+				projects = EXCLUDED.projects,
+				experience = EXCLUDED.experience
 		`
-		_, _ = s.db.Exec(query, candidate.ID, candidate.Name, candidate.Email, candidate.ResumeText, candidate.CreatedAt)
+		_, _ = s.db.Exec(query, candidate.ID, candidate.Name, candidate.Email, candidate.ResumeText, skillsJSON, projectsJSON, expJSON, candidate.CreatedAt)
 		return candidate
 	}
 
@@ -126,14 +138,18 @@ func (s *Store) SaveCandidate(candidate models.Candidate) models.Candidate {
 
 func (s *Store) Candidate(id string) (models.Candidate, bool) {
 	if s.db != nil {
-		query := `SELECT id, name, email, resume_text, created_at FROM candidates WHERE id = $1`
+		query := `SELECT id, name, email, resume_text, skills, projects, experience, created_at FROM candidates WHERE id = $1`
 		var c models.Candidate
 		var email sql.NullString
-		err := s.db.QueryRow(query, id).Scan(&c.ID, &c.Name, &email, &c.ResumeText, &c.CreatedAt)
+		var skillsRaw, projectsRaw, expRaw []byte
+		err := s.db.QueryRow(query, id).Scan(&c.ID, &c.Name, &email, &c.ResumeText, &skillsRaw, &projectsRaw, &expRaw, &c.CreatedAt)
 		if err != nil {
 			return models.Candidate{}, false
 		}
 		c.Email = email.String
+		_ = json.Unmarshal(skillsRaw, &c.Skills)
+		_ = json.Unmarshal(projectsRaw, &c.Projects)
+		_ = json.Unmarshal(expRaw, &c.Experience)
 		return c, true
 	}
 
@@ -229,7 +245,7 @@ func (s *Store) UpdateInterview(id string, fn func(*models.Interview) error) (mo
 		newBufferRaw, _ := json.Marshal(i.QuestionBuffer)
 		newScoresRaw, _ := json.Marshal(i.Scores)
 		newTranscriptRaw, _ := json.Marshal(i.Transcript)
-		
+
 		var dbEndedAt sql.NullTime
 		if i.EndedAt != nil {
 			dbEndedAt.Time = *i.EndedAt

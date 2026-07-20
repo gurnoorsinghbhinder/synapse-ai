@@ -11,11 +11,26 @@ const (
 )
 
 type Candidate struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Email      string    `json:"email"`
-	ResumeText string    `json:"resume_text"`
-	CreatedAt  time.Time `json:"created_at"`
+	ID         string             `json:"id"`
+	Name       string             `json:"name"`
+	Email      string             `json:"email"`
+	ResumeText string             `json:"resume_text"`
+	Skills     []string           `json:"skills,omitempty"`
+	Projects   []CandidateProject `json:"projects,omitempty"`
+	Experience []CandidateExp     `json:"experience,omitempty"`
+	CreatedAt  time.Time          `json:"created_at"`
+}
+
+type CandidateProject struct {
+	Name   string `json:"name"`
+	Stack  string `json:"stack"`
+	Impact string `json:"impact"`
+}
+
+type CandidateExp struct {
+	Role    string `json:"role"`
+	Company string `json:"company"`
+	Years   string `json:"years"`
 }
 
 type Interview struct {

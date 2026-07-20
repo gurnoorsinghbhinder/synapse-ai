@@ -2,12 +2,14 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -18,8 +20,11 @@ import (
 
 	"intervue/backend/internal/eventbus"
 	"intervue/backend/internal/orchestrator"
+	"intervue/backend/internal/store"
 	"intervue/backend/internal/stt"
 	"intervue/backend/shared/events"
+
+	gorilla "github.com/gorilla/websocket"
 )
 
 // AudioWebSocketHub handles the WS /interview/:id/audio endpoint.
@@ -33,9 +38,12 @@ import (
 //  6. When silence exceeds the completion threshold, TranscriptCompleted is emitted
 //  7. The orchestrator/worker loop picks up from there
 type AudioWebSocketHub struct {
-	bus  eventbus.Bus
-	orch *orchestrator.Orchestrator
-	stt  stt.Client
+	bus           eventbus.Bus
+	orch          *orchestrator.Orchestrator
+	stt           stt.Client
+	store         *store.Store
+	useGeminiLive bool
+	geminiAPIKey  string
 }
 
 // SilenceDetectorConfig controls when we consider speech to have ended.
@@ -85,11 +93,14 @@ type audioSession struct {
 	log *slog.Logger
 }
 
-func NewAudioWebSocketHub(bus eventbus.Bus, orch *orchestrator.Orchestrator, sttClient stt.Client) *AudioWebSocketHub {
+func NewAudioWebSocketHub(bus eventbus.Bus, orch *orchestrator.Orchestrator, sttClient stt.Client, store *store.Store, useGeminiLive bool, geminiAPIKey string) *AudioWebSocketHub {
 	return &AudioWebSocketHub{
-		bus:  bus,
-		orch: orch,
-		stt:  sttClient,
+		bus:           bus,
+		orch:          orch,
+		stt:           sttClient,
+		store:         store,
+		useGeminiLive: useGeminiLive,
+		geminiAPIKey:  geminiAPIKey,
 	}
 }
 
@@ -110,6 +121,12 @@ func (h *AudioWebSocketHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	log := slog.With("interview_id", interviewID, "remote", conn.RemoteAddr())
 	log.Info("audio WebSocket connected")
+
+	// If using Gemini Live, forward traffic to/from Google's Multimodal Live API
+	if h.useGeminiLive && h.geminiAPIKey != "" {
+		h.handleGeminiLive(w, r, conn, rw, interviewID, log)
+		return
+	}
 
 	session := &audioSession{
 		hub:            h,
@@ -522,4 +539,287 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (h *AudioWebSocketHub) handleGeminiLive(w http.ResponseWriter, r *http.Request, clientConn net.Conn, clientRw *bufio.ReadWriter, interviewID string, log *slog.Logger) {
+	defer clientConn.Close()
+
+	// 1. Fetch Candidate Context (Name, Resume, Role)
+	interview, ok := h.store.Interview(interviewID)
+	var candidateName, resumeText, role string
+	if ok {
+		candidate, cOk := h.store.Candidate(interview.CandidateID)
+		if cOk {
+			candidateName = candidate.Name
+			resumeText = candidate.ResumeText
+		}
+		role = interview.Role
+	}
+
+	// 2. Connect to Google Gemini Live API
+	url := fmt.Sprintf("wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=%s", h.geminiAPIKey)
+	geminiConn, _, err := gorilla.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		log.Error("failed to connect to Gemini Live WebSocket", "error", err)
+		return
+	}
+	defer geminiConn.Close()
+
+	// 3. Send setup message
+	systemInstruction := fmt.Sprintf("You are a professional software engineering technical interviewer. You are conducting a live interactive audio interview with %s for the role of %s. Here is their resume:\n%s\n\nInstructions:\n- Ask deep technical questions one at a time.\n- Dive deep into their projects, stack choices, and engineering tradeoffs.\n- Do not give away answers. Keep your questions and responses concise.\n- Welcome them first, then start the interview.", candidateName, role, resumeText)
+
+	setupMsg := map[string]any{
+		"setup": map[string]any{
+			"model": "models/gemini-2.5-flash-native-audio-latest",
+			"generationConfig": map[string]any{
+				"responseModalities": []string{"AUDIO"},
+				"speechConfig": map[string]any{
+					"voiceConfig": map[string]any{
+						"prebuiltVoiceConfig": map[string]any{
+							"voiceName": "Puck",
+						},
+					},
+				},
+			},
+			"systemInstruction": map[string]any{
+				"parts": []map[string]any{
+					{"text": systemInstruction},
+				},
+			},
+		},
+	}
+
+	if err := geminiConn.WriteJSON(setupMsg); err != nil {
+		log.Error("failed to send setup configuration to Gemini Live", "error", err)
+		return
+	}
+
+	// Send an AudioConnected event back to client
+	_ = writeJSONFrame(clientRw, map[string]any{
+		"type":    "AudioConnected",
+		"message": "Connected to Gemini Live. Speak when ready.",
+	})
+	_ = clientRw.Flush()
+
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	var currentQuestionBuilder strings.Builder
+	var clientAudioBuffer bytes.Buffer
+	var bufferMu sync.Mutex
+
+	// Loop A: Client -> Gemini Live
+	go func() {
+		defer func() {
+			cancel()
+			wg.Done()
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			frame, err := readRawFrame(clientRw)
+			if err != nil {
+				return
+			}
+
+			if isCloseFrame(frame) {
+				return
+			}
+
+			if frame.opcode == 0x1 {
+				continue
+			}
+
+			if frame.opcode != 0x2 {
+				continue
+			}
+
+			// Accumulate raw candidate audio for background evaluation transcribing
+			bufferMu.Lock()
+			clientAudioBuffer.Write(frame.payload)
+			bufferMu.Unlock()
+
+			base64Data := base64.StdEncoding.EncodeToString(frame.payload)
+			inputMsg := map[string]any{
+				"realtimeInput": map[string]any{
+					"mediaChunks": []map[string]any{
+						{
+							"mimeType": "audio/pcm;rate=16000",
+							"data":     base64Data,
+						},
+					},
+				},
+			}
+
+			if err := geminiConn.WriteJSON(inputMsg); err != nil {
+				log.Warn("failed to send audio to Gemini Live", "error", err)
+				return
+			}
+		}
+	}()
+
+	// Loop B: Gemini Live -> Client
+	go func() {
+		defer func() {
+			cancel()
+			wg.Done()
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			_, payload, err := geminiConn.ReadMessage()
+			if err != nil {
+				log.Error("error reading from Gemini Live WebSocket", "error", err)
+				return
+			}
+
+			var resp struct {
+				ServerContent *struct {
+					ModelTurn *struct {
+						Parts []struct {
+							Text       string `json:"text,omitempty"`
+							InlineData *struct {
+								MimeType string `json:"mimeType,omitempty"`
+								Data     string `json:"data,omitempty"`
+							} `json:"inlineData,omitempty"`
+						} `json:"parts,omitempty"`
+					} `json:"modelTurn,omitempty"`
+					TurnComplete bool `json:"turnComplete,omitempty"`
+				} `json:"serverContent,omitempty"`
+			}
+
+			if err := json.Unmarshal(payload, &resp); err != nil {
+				continue
+			}
+
+			if resp.ServerContent == nil {
+				continue
+			}
+
+			if resp.ServerContent.ModelTurn != nil {
+				// Candidate just finished speaking, transcribe their speech in the background for scoring
+				bufferMu.Lock()
+				if clientAudioBuffer.Len() > 0 {
+					audio := make([]byte, clientAudioBuffer.Len())
+					copy(audio, clientAudioBuffer.Bytes())
+					clientAudioBuffer.Reset()
+					bufferMu.Unlock()
+
+					go func(audioData []byte) {
+						text, err := h.stt.Transcribe(context.Background(), audioData)
+						if err == nil && text != "" {
+							completed := events.New(events.TranscriptTopic, interviewID, events.TranscriptCompleted, map[string]any{
+								"text": text,
+							})
+							h.bus.Publish(context.Background(), completed)
+
+							_, _ = h.orch.CompleteTranscript(context.Background(), interviewID, orchestrator.TranscriptRequest{Text: text})
+						}
+					}(audio)
+				} else {
+					bufferMu.Unlock()
+				}
+
+				for _, part := range resp.ServerContent.ModelTurn.Parts {
+					if part.InlineData != nil && part.InlineData.Data != "" {
+						audioBytes, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
+						if err == nil {
+							_ = writeBinaryFrame(clientRw, audioBytes)
+							_ = clientRw.Flush()
+						}
+					}
+					if part.Text != "" {
+						currentQuestionBuilder.WriteString(part.Text)
+						_ = writeJSONFrame(clientRw, map[string]any{
+							"type":   "TranscriptChunk",
+							"text":   part.Text,
+							"final":  false,
+							"offset": 0,
+						})
+						_ = clientRw.Flush()
+					}
+				}
+			}
+
+			if resp.ServerContent.TurnComplete {
+				questionText := currentQuestionBuilder.String()
+				if questionText != "" {
+					_, err = h.orch.AskQuestion(ctx, interviewID, questionText)
+					if err != nil {
+						log.Warn("failed to save question in orchestrator", "error", err)
+					}
+
+					_ = writeJSONFrame(clientRw, map[string]any{
+						"type": "TranscriptCompleted",
+						"text": questionText,
+					})
+					_ = clientRw.Flush()
+				}
+				currentQuestionBuilder.Reset()
+			}
+		}
+	}()
+
+	wg.Wait()
+}
+
+func readRawFrame(rw *bufio.ReadWriter) (wsFrame, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(rw, header); err != nil {
+		return wsFrame{}, err
+	}
+
+	opcode := header[0] & 0x0F
+	masked := (header[1] & 0x80) != 0
+	length := int64(header[1] & 0x7F)
+
+	switch {
+	case length == 126:
+		ext := make([]byte, 2)
+		if _, err := io.ReadFull(rw, ext); err != nil {
+			return wsFrame{}, err
+		}
+		length = int64(binary.BigEndian.Uint16(ext))
+	case length == 127:
+		ext := make([]byte, 8)
+		if _, err := io.ReadFull(rw, ext); err != nil {
+			return wsFrame{}, err
+		}
+		length = int64(binary.BigEndian.Uint64(ext))
+	}
+
+	var maskKey [4]byte
+	if masked {
+		if _, err := io.ReadFull(rw, maskKey[:]); err != nil {
+			return wsFrame{}, err
+		}
+	}
+
+	payload := make([]byte, length)
+	if length > 0 {
+		if _, err := io.ReadFull(rw, payload); err != nil {
+			return wsFrame{}, err
+		}
+	}
+
+	if masked {
+		for i := range payload {
+			payload[i] ^= maskKey[i%4]
+		}
+	}
+
+	return wsFrame{opcode: opcode, payload: payload}, nil
 }

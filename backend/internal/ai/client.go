@@ -10,6 +10,27 @@ type Client interface {
 	EvaluateAnswer(EvaluationRequest) (EvaluationResult, error)
 	ExtractResumeContext(resumeText string) ([]string, error)
 	SummarizeInterview(SummarizeRequest) (string, error)
+	ParseResume(resumeText string) (CandidateProfile, error)
+}
+
+type CandidateProfile struct {
+	Name       string             `json:"name"`
+	Email      string             `json:"email"`
+	Skills     []string           `json:"skills"`
+	Projects   []CandidateProject `json:"projects"`
+	Experience []CandidateExp     `json:"experience"`
+}
+
+type CandidateProject struct {
+	Name   string `json:"name"`
+	Stack  string `json:"stack"`
+	Impact string `json:"impact"`
+}
+
+type CandidateExp struct {
+	Role    string `json:"role"`
+	Company string `json:"company"`
+	Years   string `json:"years"`
 }
 
 type QuestionRequest struct {
@@ -140,4 +161,36 @@ func clamp(value int, minValue int, maxValue int) int {
 		return maxValue
 	}
 	return value
+}
+
+func (MockClient) ParseResume(resumeText string) (CandidateProfile, error) {
+	return CandidateProfile{
+		Name:  "Demo Candidate",
+		Email: "demo@synapse.local",
+		Skills: []string{"Go", "React", "Docker", "PostgreSQL", "WebSockets", "Kafka", "Redis", "System Design"},
+		Projects: []CandidateProject{
+			{
+				Name:   "Realtime Interview Platform",
+				Stack:  "Go, WebSockets, Postgres, React",
+				Impact: "Decoupled API gateway and workers, cutting audio latency down to sub-100ms.",
+			},
+			{
+				Name:   "Distributed Log Consumer",
+				Stack:  "Go, Kafka, Redis",
+				Impact: "Optimized consumer groups to handle 10k events/sec under network constraints.",
+			},
+		},
+		Experience: []CandidateExp{
+			{
+				Role:    "Senior Backend Engineer",
+				Company: "Synapse AI",
+				Years:   "2024 - Present",
+			},
+			{
+				Role:    "Software Engineer",
+				Company: "Distributed Labs",
+				Years:   "2022 - 2024",
+			},
+		},
+	}, nil
 }

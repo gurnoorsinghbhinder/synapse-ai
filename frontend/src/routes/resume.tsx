@@ -1,10 +1,9 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { SiteNav } from "@/components/site-nav";
-import { mockExperience, mockProjects, mockSkills } from "@/lib/mock";
-import { uploadResume } from "@/lib/backend";
-import { setCandidateId } from "@/lib/session";
+import { getCandidate, uploadResume, type CandidateProject, type CandidateExp } from "@/lib/backend";
+import { getCandidateId, setCandidateId } from "@/lib/session";
 import { UploadCloud, FileText, Check } from "lucide-react";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 export const Route = createFileRoute("/resume")({
   head: () => ({
@@ -22,14 +21,33 @@ function ResumePage() {
   const nav = useNavigate();
   const [parsed, setParsed] = useState(false);
   const [drag, setDrag] = useState(false);
-  const [name, setName] = useState("Demo Candidate");
-  const [email, setEmail] = useState("demo@synapse.local");
-  const [resumeText, setResumeText] = useState(
-    "Built realtime systems with Go, Kafka-compatible events, WebSockets, Redis, Postgres, and React. Led backend architecture for low-latency interview workflows.",
-  );
-  const [fileName, setFileName] = useState("resume.txt");
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [resumeText, setResumeText] = useState("");
+  const [skills, setSkills] = useState<string[]>([]);
+  const [projects, setProjects] = useState<CandidateProject[]>([]);
+  const [experience, setExperience] = useState<CandidateExp[]>([]);
+  const [fileName, setFileName] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    const candidateId = getCandidateId();
+    if (!candidateId) return;
+
+    getCandidate(candidateId)
+      .then((c) => {
+        setName(c.name || "");
+        setEmail(c.email || "");
+        setResumeText(c.resume_text || "");
+        setSkills(c.skills || []);
+        setProjects(c.projects || []);
+        setExperience(c.experience || []);
+        setFileName("Saved Profile");
+        setParsed(true);
+      })
+      .catch(() => {});
+  }, []);
 
   async function readFile(file: File) {
     const text = await file.text();
@@ -43,9 +61,19 @@ function ResumePage() {
     setStatus(null);
     try {
       const result = await uploadResume({ name, email, resumeText });
-      setCandidateId(result.candidate.id);
+      const c = result.candidate;
+      setCandidateId(c.id);
+      
+      setName(c.name || "");
+      setEmail(c.email || "");
+      setResumeText(c.resume_text || "");
+      setSkills(c.skills || []);
+      setProjects(c.projects || []);
+      setExperience(c.experience || []);
+
       setParsed(true);
-      setStatus(`Backend profile ready · ${result.candidate.id}`);
+      setFileName("Parsed Profile");
+      setStatus(`Backend profile ready · ${c.id}`);
     } catch (err) {
       setStatus(err instanceof Error ? err.message : "Resume upload failed");
     } finally {
@@ -87,15 +115,15 @@ function ResumePage() {
               <UploadCloud className="size-5" />
             </div>
             <div>
-              <p className="font-medium">Drop your resume PDF here</p>
-              <p className="text-xs text-muted-foreground">Max 5 MB · PDF or DOCX</p>
+              <p className="font-medium">Drop your resume file here</p>
+              <p className="text-xs text-muted-foreground">Max 5 MB · TXT or MD files supported</p>
             </div>
             <label className="mt-2 inline-flex h-9 cursor-pointer items-center rounded-md bg-foreground px-4 text-xs font-medium text-background hover:opacity-90">
               Choose file
               <input
                 type="file"
                 className="sr-only"
-                accept=".txt,.md,.pdf,.doc,.docx"
+                accept=".txt,.md"
                 onChange={(e) => {
                   const file = e.currentTarget.files?.[0];
                   if (file) void readFile(file);
@@ -109,6 +137,7 @@ function ResumePage() {
               <input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
+                placeholder="Extracting..."
                 className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-brand"
               />
             </label>
@@ -117,6 +146,7 @@ function ResumePage() {
               <input
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
+                placeholder="Extracting..."
                 className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm outline-none focus:border-brand"
               />
             </label>
@@ -125,6 +155,7 @@ function ResumePage() {
               <textarea
                 value={resumeText}
                 onChange={(e) => setResumeText(e.target.value)}
+                placeholder="Paste your resume text here or drag and drop a file..."
                 rows={6}
                 className="w-full resize-none rounded-md border border-border bg-background px-3 py-2 text-sm leading-relaxed outline-none focus:border-brand"
               />
@@ -148,42 +179,54 @@ function ResumePage() {
         <section className="mb-10">
           <SectionHeader label="/skills" title="Extracted skills" />
           <div className="flex flex-wrap gap-2">
-            {mockSkills.map((s) => (
-              <span
-                key={s}
-                className="rounded-md border border-border bg-card px-3 py-1.5 font-mono text-[11px] tracking-tight"
-              >
-                {s}
-              </span>
-            ))}
+            {skills.length === 0 ? (
+              <span className="text-xs text-muted-foreground italic">No skills extracted yet. Save your profile to trigger AI extraction.</span>
+            ) : (
+              skills.map((s) => (
+                <span
+                  key={s}
+                  className="rounded-md border border-border bg-card px-3 py-1.5 font-mono text-[11px] tracking-tight"
+                >
+                  {s}
+                </span>
+              ))
+            )}
           </div>
         </section>
 
         <section className="mb-10">
           <SectionHeader label="/projects" title="Projects" />
           <div className="grid gap-3 md:grid-cols-2">
-            {mockProjects.map((p) => (
-              <div key={p.name} className="rounded-xl border border-border bg-card p-5">
-                <p className="font-display text-base font-semibold">{p.name}</p>
-                <p className="mt-1 font-mono text-[11px] text-brand">{p.stack}</p>
-                <p className="mt-3 text-xs text-muted-foreground">{p.impact}</p>
-              </div>
-            ))}
+            {projects.length === 0 ? (
+              <p className="text-xs text-muted-foreground italic col-span-2">No projects extracted yet.</p>
+            ) : (
+              projects.map((p) => (
+                <div key={p.name} className="rounded-xl border border-border bg-card p-5">
+                  <p className="font-display text-base font-semibold">{p.name}</p>
+                  <p className="mt-1 font-mono text-[11px] text-brand">{p.stack}</p>
+                  <p className="mt-3 text-xs text-muted-foreground">{p.impact}</p>
+                </div>
+              ))
+            )}
           </div>
         </section>
 
         <section className="mb-12">
           <SectionHeader label="/experience" title="Experience" />
           <div className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card">
-            {mockExperience.map((e) => (
-              <div key={e.role} className="flex items-center justify-between px-5 py-4">
-                <div>
-                  <p className="font-medium">{e.role}</p>
-                  <p className="text-xs text-muted-foreground">{e.company}</p>
+            {experience.length === 0 ? (
+              <p className="text-xs text-muted-foreground italic p-5">No experience extracted yet.</p>
+            ) : (
+              experience.map((e) => (
+                <div key={e.role} className="flex items-center justify-between px-5 py-4">
+                  <div>
+                    <p className="font-medium">{e.role}</p>
+                    <p className="text-xs text-muted-foreground">{e.company}</p>
+                  </div>
+                  <p className="font-mono text-xs text-muted-foreground">{e.years}</p>
                 </div>
-                <p className="font-mono text-xs text-muted-foreground">{e.years}</p>
-              </div>
-            ))}
+              ))
+            )}
           </div>
         </section>
 

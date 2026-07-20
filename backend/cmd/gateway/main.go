@@ -58,8 +58,13 @@ func main() {
 	orch := orchestrator.New(bus, repository, aiClient)
 
 	var ttsClient tts.Client
-	ttsClient = tts.NewMockClient()
-	slog.Info("using mock TTS client for audio synthesis")
+	if os.Getenv("PIPER_BASE_URL") != "" {
+		ttsClient = tts.NewPiperClient()
+		slog.Info("using Piper TTS client", "base_url", os.Getenv("PIPER_BASE_URL"))
+	} else {
+		ttsClient = tts.NewMockClient()
+		slog.Info("using mock TTS client for audio synthesis")
+	}
 
 	var storageClient storage.Client
 	supabaseURL := os.Getenv("SUPABASE_URL")
@@ -80,10 +85,29 @@ func main() {
 	ws := transport.NewWebSocketHub(bus, bus)
 
 	var sttClient stt.Client
-	sttClient = stt.NewMockClient()
-	slog.Info("using mock STT client for audio transcription")
+	if os.Getenv("WHISPER_BASE_URL") != "" {
+		sttClient = stt.NewWhisperClient()
+		slog.Info("using Whisper STT client", "base_url", os.Getenv("WHISPER_BASE_URL"))
+	} else if os.Getenv("GEMINI_API_KEY") != "" || os.Getenv("GOOGLE_API_KEY") != "" {
+		sttClient = stt.NewGeminiSTTClient()
+		slog.Info("using Gemini STT client for audio transcription")
+	} else {
+		sttClient = stt.NewMockClient()
+		slog.Info("using mock STT client for audio transcription")
+	}
 
-	server := gateway.NewWithAudio(repository, orch, ws, bus, sttClient)
+	useGeminiLive := getenv("USE_GEMINI_LIVE", "false") == "true"
+	if useGeminiLive {
+		slog.Info("Gemini Live voice mode enabled")
+	} else {
+		slog.Info("Using local STT/TTS or mocks for voice")
+	}
+	geminiAPIKey := getenv("GEMINI_API_KEY", "")
+	if geminiAPIKey == "" {
+		geminiAPIKey = getenv("GOOGLE_API_KEY", "")
+	}
+
+	server := gateway.NewWithAudio(repository, orch, ws, bus, sttClient, aiClient, useGeminiLive, geminiAPIKey)
 
 	port := getenv("PORT", "8080")
 	httpServer := &http.Server{

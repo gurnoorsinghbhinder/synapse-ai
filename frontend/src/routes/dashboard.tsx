@@ -29,14 +29,11 @@ function Dashboard() {
     try {
       let candidateId = getCandidateId();
       if (!candidateId) {
-        const profile = await uploadResume({
-          name: mockUser.name,
-          email: "demo@synapse.local",
-          resumeText:
-            "Built event-driven interview systems with Go, Kafka-compatible topics, worker fanout, WebSockets, Postgres, Redis, and React.",
-        });
-        candidateId = profile.candidate.id;
-        setCandidateId(candidateId);
+        setError("Candidate profile not found. Redirecting you to upload a resume first...");
+        setTimeout(() => {
+          nav({ to: "/resume" });
+        }, 1500);
+        return;
       }
       const interview = await startInterview({
         candidateId,
@@ -45,7 +42,16 @@ function Dashboard() {
       setInterviewId(interview.id);
       nav({ to: "/interview" });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not start interview");
+      const msg = err instanceof Error ? err.message : "Could not start interview";
+      if (msg.includes("not found") || msg.includes("candidate")) {
+        setCandidateId(""); // Clear stale/wiped candidate ID
+        setError("Candidate profile not found. Redirecting you to upload a resume...");
+        setTimeout(() => {
+          nav({ to: "/resume" });
+        }, 1500);
+      } else {
+        setError(msg);
+      }
     } finally {
       setStarting(false);
     }

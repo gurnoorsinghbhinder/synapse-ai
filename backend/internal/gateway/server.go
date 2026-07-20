@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"intervue/backend/internal/ai"
 	"intervue/backend/internal/eventbus"
 	"intervue/backend/internal/orchestrator"
 	"intervue/backend/internal/store"
@@ -23,14 +24,16 @@ type Server struct {
 	orchestrator *orchestrator.Orchestrator
 	ws           *transport.WebSocketHub
 	audioWS      *transport.AudioWebSocketHub
+	ai           ai.Client
 }
 
-func New(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebSocketHub) *Server {
+func New(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebSocketHub, aiClient ai.Client) *Server {
 	server := &Server{
 		mux:          http.NewServeMux(),
 		store:        store,
 		orchestrator: orch,
 		ws:           ws,
+		ai:           aiClient,
 	}
 	server.routes()
 	return server
@@ -38,13 +41,14 @@ func New(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebS
 
 // NewWithAudio creates a server with audio WebSocket support.
 // Pass in the eventbus.Bus explicitly since it's not exported from the orchestrator.
-func NewWithAudio(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebSocketHub, bus eventbus.Bus, sttClient stt.Client) *Server {
+func NewWithAudio(store *store.Store, orch *orchestrator.Orchestrator, ws *transport.WebSocketHub, bus eventbus.Bus, sttClient stt.Client, aiClient ai.Client, useGeminiLive bool, geminiAPIKey string) *Server {
 	server := &Server{
 		mux:          http.NewServeMux(),
 		store:        store,
 		orchestrator: orch,
 		ws:           ws,
-		audioWS:      transport.NewAudioWebSocketHub(bus, orch, sttClient),
+		audioWS:      transport.NewAudioWebSocketHub(bus, orch, sttClient, store, useGeminiLive, geminiAPIKey),
+		ai:           aiClient,
 	}
 	server.routes()
 	return server
@@ -61,6 +65,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /interview/end", s.endInterview)
 	s.mux.HandleFunc("GET /interview/{id}", s.getInterview)
 	s.mux.HandleFunc("POST /interview/{id}/transcript", s.completeTranscript)
+	s.mux.HandleFunc("GET /candidate/{id}", s.getCandidate)
 	s.mux.Handle("/ws", s.ws)
 
 	// Audio WebSocket endpoint — only registered if audioWS was set
@@ -105,10 +110,42 @@ func (s *Server) uploadResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Use Gemini to dynamically parse the resume text
+	parsed, err := s.ai.ParseResume(req.ResumeText)
+	if err != nil {
+		// Log error and fall back to mock fields or empty arrays
+		parsed = ai.CandidateProfile{
+			Name:  fallback(req.Name, "Demo Candidate"),
+			Email: req.Email,
+		}
+	}
+
+	// Convert parsed structures into DB structures
+	skills := parsed.Skills
+	projects := make([]models.CandidateProject, len(parsed.Projects))
+	for i, p := range parsed.Projects {
+		projects[i] = models.CandidateProject{
+			Name:   p.Name,
+			Stack:  p.Stack,
+			Impact: p.Impact,
+		}
+	}
+	experience := make([]models.CandidateExp, len(parsed.Experience))
+	for i, e := range parsed.Experience {
+		experience[i] = models.CandidateExp{
+			Role:    e.Role,
+			Company: e.Company,
+			Years:   e.Years,
+		}
+	}
+
 	candidate := s.store.SaveCandidate(models.Candidate{
-		Name:       fallback(req.Name, "Demo Candidate"),
-		Email:      req.Email,
+		Name:       fallback(parsed.Name, fallback(req.Name, "Demo Candidate")),
+		Email:      fallback(parsed.Email, req.Email),
 		ResumeText: req.ResumeText,
+		Skills:     skills,
+		Projects:   projects,
+		Experience: experience,
 		CreatedAt:  time.Now().UTC(),
 	})
 
@@ -131,7 +168,8 @@ func (s *Server) startInterview(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, store.ErrNotFound) {
-			status = http.StatusNotFound
+			writeError(w, http.StatusNotFound, errors.New("candidate profile not found; please upload a resume first"))
+			return
 		}
 		writeError(w, status, err)
 		return
@@ -168,6 +206,16 @@ func (s *Server) getInterview(w http.ResponseWriter, r *http.Request) {
 		"interview": interview,
 		"timeline":  s.store.Timeline(id),
 	})
+}
+
+func (s *Server) getCandidate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	candidate, ok := s.store.Candidate(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, store.ErrNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, candidate)
 }
 
 func (s *Server) completeTranscript(w http.ResponseWriter, r *http.Request) {
